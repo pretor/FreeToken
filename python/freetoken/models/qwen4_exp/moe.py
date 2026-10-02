@@ -33,6 +33,14 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         self._tp_size = get_tp_info().size
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        res = self.forward_parts(hidden_states)
+        if isinstance(res, tuple):
+            routed, shared, gate = res
+            return shared_gate_mul_add(routed, shared, gate)
+        return res
+
+    def forward_parts(self, hidden_states: torch.Tensor):
+        """The epilogue split into parts: the caller may fold mul-add into its own kernel."""
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
@@ -52,7 +60,7 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             return out.view(num_tokens, hidden_dim)
         shared = se.forward(hidden_states)
         routed = ex.forward(hidden_states=hidden_states, router_logits=router_logits)
-        return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
+        return routed.view(num_tokens, hidden_dim), shared, gate
 
 
 __all__ = ["Qwen4ExpMoE"]

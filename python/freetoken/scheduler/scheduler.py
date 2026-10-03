@@ -429,18 +429,21 @@ class Scheduler(SchedulerIOMixin):
                             m = min(m, tok_idx)
                             break
 
-                    start_free = req.cached_len + m + 1
-                    end_free = req.cached_len + 1 + k
+                    old_cached_len = req.cached_len
+                    start_free = old_cached_len + m + 1
+                    end_free = old_cached_len + 1 + k
                     if end_free > start_free:
                         unused_slots = self.engine.page_table[req.table_idx, start_free:end_free]
                         self.cache_manager._free(unused_slots)
                         self.engine.page_table[req.table_idx, start_free:end_free] = -1
 
-                    req.cached_len = req.cached_len + len(tokens_to_emit)
-                    req.device_len = req.cached_len
+                    req.cached_len = old_cached_len + len(tokens_to_emit)
+                    req.device_len = req.cached_len + 1
+                    req.input_ids = req._ids_buf[: req.cached_len]
 
                     if not finished and len(tokens_to_emit) > 0:
                         self.token_pool[req.table_idx, req.cached_len] = tokens_to_emit[-1]
+                        req._ids_buf[req.cached_len] = tokens_to_emit[-1]
 
                     if m < k and self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
                         pool = self.engine.linear_state_pool
@@ -1016,6 +1019,7 @@ class Scheduler(SchedulerIOMixin):
                 req._ids_buf[req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu
                 self.token_pool[req.table_idx, req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu.to(self.device)
                 req.device_len = req.cached_len + 1 + k
+                req.input_ids = req._ids_buf[: req.device_len]
 
                 if self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
                     pool = self.engine.linear_state_pool

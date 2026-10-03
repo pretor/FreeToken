@@ -143,6 +143,7 @@ class Scheduler(SchedulerIOMixin):
         )
         self.config = config
         self.draft_provider = None
+        self._spec_backup_slot = None
         if getattr(config, "enable_prompt_lookup", False):
             from freetoken.speculative import PromptLookupDraftProvider
 
@@ -151,6 +152,8 @@ class Scheduler(SchedulerIOMixin):
                 max_draft_len=getattr(config, "prompt_lookup_max_draft", 4),
                 min_ngram_size=getattr(config, "prompt_lookup_min_ngram", 2),
             )
+            if self.engine.linear_state_pool is not None:
+                self._spec_backup_slot = self.engine.linear_state_pool.alloc(1)[0]
             logger.info(
                 f"Prompt Lookup Decoding initialized (ngram={config.prompt_lookup_ngram}, max_draft={config.prompt_lookup_max_draft})"
             )
@@ -430,14 +433,25 @@ class Scheduler(SchedulerIOMixin):
                             break
 
                     old_cached_len = req.cached_len
-                    start_free = old_cached_len + m + 1
-                    end_free = old_cached_len + 1 + k
-                    if end_free > start_free:
-                        unused_slots = self.engine.page_table[req.table_idx, start_free:end_free]
-                        self.cache_manager._free(unused_slots)
-                        self.engine.page_table[req.table_idx, start_free:end_free] = -1
+                    accepted_len = old_cached_len + len(tokens_to_emit)
+                    page_size = self.config.page_size
 
-                    req.cached_len = old_cached_len + len(tokens_to_emit)
+                    alloc_pages = (old_cached_len + 1 + k + page_size - 1) // page_size - (old_cached_len + page_size - 1) // page_size
+                    needed_pages = (accepted_len + page_size - 1) // page_size - (old_cached_len + page_size - 1) // page_size
+                    pages_to_free = max(0, alloc_pages - needed_pages)
+
+                    if pages_to_free > 0:
+                        free_start_page = (accepted_len + page_size - 1) // page_size
+                        free_end_page = free_start_page + pages_to_free
+                        free_slots = self.engine.page_table[
+                            req.table_idx, free_start_page * page_size : free_end_page * page_size : page_size
+                        ]
+                        self.cache_manager._free(free_slots)
+
+                    if old_cached_len + 1 + k > accepted_len:
+                        self.engine.page_table[req.table_idx, accepted_len : old_cached_len + 1 + k] = -1
+
+                    req.cached_len = accepted_len
                     req.device_len = req.cached_len + 1
                     req.input_ids = req._ids_buf[: req.cached_len]
 
@@ -445,9 +459,8 @@ class Scheduler(SchedulerIOMixin):
                         self.token_pool[req.table_idx, req.cached_len] = tokens_to_emit[-1]
                         req._ids_buf[req.cached_len] = tokens_to_emit[-1]
 
-                    if m < k and self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
-                        pool = self.engine.linear_state_pool
-                        pool.copy_from(pool.padding_slot, req.linear_slot_idx)
+                    if m < k and self._spec_backup_slot is not None and req.linear_slot_idx is not None:
+                        self.engine.linear_state_pool.copy_from(self._spec_backup_slot, req.linear_slot_idx)
 
                     req.pending_draft = None
                     if finished and req not in self.finished_reqs:
@@ -1021,9 +1034,8 @@ class Scheduler(SchedulerIOMixin):
                 req.device_len = req.cached_len + 1 + k
                 req.input_ids = req._ids_buf[: req.device_len]
 
-                if self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
-                    pool = self.engine.linear_state_pool
-                    pool.copy_from(req.linear_slot_idx, pool.padding_slot)
+                if self._spec_backup_slot is not None and req.linear_slot_idx is not None:
+                    self.engine.linear_state_pool.copy_from(req.linear_slot_idx, self._spec_backup_slot)
 
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)

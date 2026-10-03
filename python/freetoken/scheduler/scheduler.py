@@ -441,15 +441,11 @@ class Scheduler(SchedulerIOMixin):
                     pages_to_free = max(0, alloc_pages - needed_pages)
 
                     if pages_to_free > 0:
-                        free_start_page = (accepted_len + page_size - 1) // page_size
-                        free_end_page = free_start_page + pages_to_free
-                        free_slots = self.engine.page_table[
-                            req.table_idx, free_start_page * page_size : free_end_page * page_size : page_size
-                        ]
-                        self.cache_manager._free(free_slots)
-
-                    if old_cached_len + 1 + k > accepted_len:
-                        self.engine.page_table[req.table_idx, accepted_len : old_cached_len + 1 + k] = -1
+                        free_start_pos = ((accepted_len + page_size - 1) // page_size) * page_size
+                        free_end_pos = free_start_pos + pages_to_free * page_size
+                        free_tokens = self.engine.page_table[req.table_idx, free_start_pos : free_end_pos]
+                        self.cache_manager._free(free_tokens)
+                        self.engine.page_table[req.table_idx, free_start_pos : free_end_pos] = -1
 
                     req.cached_len = accepted_len
                     req.device_len = req.cached_len + 1
@@ -462,6 +458,11 @@ class Scheduler(SchedulerIOMixin):
                     if m < k and self._spec_backup_slot is not None and req.linear_slot_idx is not None:
                         self.engine.linear_state_pool.copy_from(self._spec_backup_slot, req.linear_slot_idx)
 
+                    logger.info_rank0(
+                        f"[SPEC] verified: accepted={m}/{k}, emitted={len(tokens_to_emit)}, "
+                        f"pages_to_free={pages_to_free}, finished={finished}"
+                    )
+
                     req.pending_draft = None
                     if finished and req not in self.finished_reqs:
                         self.decode_manager.remove_req(req)
@@ -471,7 +472,6 @@ class Scheduler(SchedulerIOMixin):
                         candidate = self.draft_provider.propose(req.input_ids, req.prompt_len)
                         if candidate and candidate.has_draft:
                             req.pending_draft = candidate.draft_tokens
-                self.decode_manager.filter_reqs(batch.reqs)
             else:
                 for i, req in enumerate(batch.reqs):
                     if isinstance(req, ChunkedReq):
@@ -775,10 +775,17 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        logger.info_rank0(
+            f"[_FREE_REQ] uid={req.uid}, table_idx={req.table_idx}, cached_len={req.cached_len}, "
+            f"free_pages_before={len(self.cache_manager.free_slots)}"
+        )
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
         self.cache_manager.cache_req(req, finished=True)
+        logger.info_rank0(
+            f"[_FREE_REQ_DONE] uid={req.uid}, free_pages_after={len(self.cache_manager.free_slots)}"
+        )
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
 

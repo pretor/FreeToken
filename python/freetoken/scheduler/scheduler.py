@@ -384,90 +384,139 @@ class Scheduler(SchedulerIOMixin):
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
-                    if req.aborted:
-                        # Aborted mid-chunked-prefill while this chunk was in flight: the abort
-                        # popped the pending continuation (no next chunk launches), and this
-                        # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
-                    else:
-                        # The chunk's PAGES must stay out of the tree (double-free above), but its
-                        # x64 GDN checkpoint owns none: archive it here, stream-ordered after it.
-                        self.cache_manager.archive_chunk_track(req)
-                    continue
+            if getattr(batch, "is_speculative", False):
+                req = batch.reqs[0]
                 if req.aborted:
-                    # Aborted while this final-chunk prefill / decode step was in flight: free
-                    # here (the forward is drained) and finish the request. No DetokenizeMsg --
-                    # the abort ack flushed after this method stays the uid's terminal reply.
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
-                    continue
-                if req in self.finished_reqs:
-                    # Overlap scheduling launched one more decode step for a request that
-                    # already terminated (filter_reqs keeps it while output budget remains,
-                    # and the next batch is scheduled before this drain runs). Its resources
-                    # are freed below/already; shipping this token would append past the
-                    # client's terminal reply.
-                    continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                # Overlap can advance device_len ahead of the token delivered to the host.
-                hit_length = req.input_ids.numel() >= req.max_device_len
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                elif req not in self.finished_reqs:
+                    draft_tokens = getattr(batch, "speculative_draft", None) or []
+                    k = len(draft_tokens)
+                    sampled_tokens = getattr(batch, "speculative_sampled_cpu", None)
+                    preds = sampled_tokens.tolist() if sampled_tokens is not None else []
+                    from freetoken.speculative import SpeculativeVerifier
+                    result = SpeculativeVerifier.verify_greedy(draft_tokens, preds)
+
+                    tokens_to_emit = result.all_tokens
+                    m = result.num_accepted
+                    finished = False
+                    finish_reason = None
+                    matched_stop = None
+
+                    for tok_idx, tok in enumerate(tokens_to_emit):
+                        tok_tensor = torch.tensor([tok], dtype=torch.int32)
+                        req.append_host(tok_tensor)
+
+                        hit_length = req.input_ids.numel() >= req.max_device_len
+                        hit_eos = not req.sampling_params.ignore_eos and tok in self.eos_token_ids
+                        matched_stop = self._match_stop_str(req) if not hit_eos and req.sampling_params.stop_strs else None
+                        finished = hit_length or hit_eos or matched_stop is not None
+                        finish_reason = ("stop" if (hit_eos or matched_stop is not None) else "length") if finished else None
+
+                        reply.append(
+                            DetokenizeMsg(
+                                uid=req.uid,
+                                next_token=tok,
+                                finished=finished,
+                                finish_reason=finish_reason,
+                                matched_stop=matched_stop,
+                                stop_strs=req.sampling_params.stop_strs or None,
+                            )
+                        )
+                        if finished:
+                            tokens_to_emit = tokens_to_emit[: tok_idx + 1]
+                            m = min(m, tok_idx)
+                            break
+
+                    start_free = req.cached_len + m + 1
+                    end_free = req.cached_len + 1 + k
+                    if end_free > start_free:
+                        unused_slots = self.engine.page_table[req.table_idx, start_free:end_free]
+                        self.cache_manager._free(unused_slots)
+                        self.engine.page_table[req.table_idx, start_free:end_free] = -1
+
+                    req.cached_len = req.cached_len + len(tokens_to_emit)
+                    req.device_len = req.cached_len
+
+                    if not finished and len(tokens_to_emit) > 0:
+                        self.token_pool[req.table_idx, req.cached_len] = tokens_to_emit[-1]
+
+                    if m < k and self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
+                        pool = self.engine.linear_state_pool
+                        pool.copy_from(pool.padding_slot, req.linear_slot_idx)
+
+                    req.pending_draft = None
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif not finished and self.draft_provider is not None:
+                        candidate = self.draft_provider.propose(req.input_ids, req.prompt_len)
+                        if candidate and candidate.has_draft:
+                            req.pending_draft = candidate.draft_tokens
+                self.decode_manager.filter_reqs(batch.reqs)
+            else:
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        if req.aborted:
+                            self._free_req_resources(req)
+                        else:
+                            self.cache_manager.archive_chunk_track(req)
+                        continue
+                    if req.aborted:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                        continue
+                    if req in self.finished_reqs:
+                        continue
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    hit_length = req.input_ids.numel() >= req.max_device_len
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif batch.is_prefill and req.table_idx != -1:
+                        self.cache_manager.cache_req(req, finished=False)
 
+                    if not finished and self.draft_provider is not None and req not in new_finished_reqs:
+                        candidate = self.draft_provider.propose(req.input_ids, req.prompt_len)
+                        if candidate and candidate.has_draft:
+                            req.pending_draft = candidate.draft_tokens
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
@@ -953,6 +1002,25 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+
+        if self.draft_provider is not None and batch.is_decode and len(batch.reqs) == 1:
+            req = batch.reqs[0]
+            if req.pending_draft and len(req.pending_draft) > 0 and req.remain_len > len(req.pending_draft):
+                max_draft = getattr(self.config, "prompt_lookup_max_draft", 3)
+                draft_tokens = req.pending_draft[:max_draft]
+                k = len(draft_tokens)
+                batch.phase = "speculative"
+                batch.speculative_draft = list(draft_tokens)
+
+                draft_tensor_cpu = torch.tensor(draft_tokens, dtype=torch.int32)
+                req._ids_buf[req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu
+                self.token_pool[req.table_idx, req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu.to(self.device)
+                req.device_len = req.cached_len + 1 + k
+
+                if self.engine.linear_state_pool is not None and req.linear_slot_idx is not None:
+                    pool = self.engine.linear_state_pool
+                    pool.copy_from(req.linear_slot_idx, pool.padding_slot)
+
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -986,8 +1054,9 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if not getattr(batch, "is_speculative", False):
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
 

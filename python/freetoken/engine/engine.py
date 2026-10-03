@@ -1093,13 +1093,23 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
+        use_graph = not getattr(batch, "is_speculative", False) and self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+
+        if getattr(batch, "is_speculative", False):
+            sampled_tokens_gpu = logits.argmax(dim=-1).to(torch.int32)
+            sampled_tokens_cpu = sampled_tokens_gpu.to("cpu", non_blocking=True)
+            batch.speculative_sampled_cpu = sampled_tokens_cpu
+            next_tokens_gpu = sampled_tokens_gpu[: batch.size]
+            next_tokens_cpu = sampled_tokens_cpu[: batch.size]
+            copy_done_event = torch.cuda.Event()
+            copy_done_event.record(self.stream)
+            return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
         for req in batch.reqs:
             req.complete_one()

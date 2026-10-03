@@ -71,6 +71,7 @@ class Req:
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
     prompt_len: int = 0
+    pending_draft: list[int] | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -121,7 +122,7 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "speculative"]
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
@@ -168,9 +169,16 @@ class Batch:
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
 
+    speculative_draft: List[int] | None = None
+    speculative_sampled_cpu: torch.Tensor | None = None
+
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_speculative(self) -> bool:
+        return self.phase == "speculative"
 
     def get_attn_positions(self) -> torch.Tensor:
         return self.mrope_positions if self.mrope_positions is not None else self.positions

@@ -66,5 +66,37 @@ class TestPromptLookupIntegration(unittest.TestCase):
         self.assertEqual(res.total_emitted, 4)
 
 
+    def test_batch_speculative_phase(self):
+        from freetoken.core import Batch
+        prompt_ids = torch.tensor([10, 20, 30], dtype=torch.int32)
+        req = Req(
+            input_ids=prompt_ids,
+            table_idx=0,
+            cached_len=0,
+            output_len=50,
+            uid=1,
+            sampling_params=SamplingParams(),
+            cache_handle=MockCacheHandle(0),
+        )
+        batch = Batch(reqs=[req], phase="speculative")
+        self.assertTrue(batch.is_speculative)
+        self.assertFalse(batch.is_decode)
+        self.assertFalse(batch.is_prefill)
+
+    def test_req_pending_draft_field(self):
+        prompt_ids = torch.tensor([1, 2, 3], dtype=torch.int32)
+        req = Req(
+            input_ids=prompt_ids,
+            table_idx=0,
+            cached_len=0,
+            output_len=50,
+            uid=1,
+            sampling_params=SamplingParams(),
+            cache_handle=MockCacheHandle(0),
+        )
+        self.assertIsNone(req.pending_draft)
+        req.pending_draft = [4, 5, 6]
+        self.assertEqual(req.pending_draft, [4, 5, 6])
+
 if __name__ == "__main__":
     unittest.main()

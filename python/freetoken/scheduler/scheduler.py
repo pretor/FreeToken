@@ -142,6 +142,18 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self.draft_provider = None
+        if getattr(config, "enable_prompt_lookup", False):
+            from freetoken.speculative import PromptLookupDraftProvider
+
+            self.draft_provider = PromptLookupDraftProvider(
+                ngram_size=getattr(config, "prompt_lookup_ngram", 3),
+                max_draft_len=getattr(config, "prompt_lookup_max_draft", 4),
+                min_ngram_size=getattr(config, "prompt_lookup_min_ngram", 2),
+            )
+            logger.info(
+                f"Prompt Lookup Decoding initialized (ngram={config.prompt_lookup_ngram}, max_draft={config.prompt_lookup_max_draft})"
+            )
         self._model_is_mrope = config.model_config.model_is_mrope
         self._warned_cut_image = False
         self.status_reporter = SchedulerStatusReporter(

@@ -221,6 +221,7 @@ class PrefillAdder:
         req.mm_items = pending_req.mm_items
         req.mrope_positions_full = pending_req.mrope_positions_full
         req.mrope_delta = pending_req.mrope_delta
+        req.prompt_len = pending_req.input_len
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
         req.linear_slot_idx = linear_slot_idx

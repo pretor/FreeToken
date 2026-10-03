@@ -19,6 +19,12 @@ class SchedulerConfig(EngineConfig):
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
 
+    # speculative / prompt lookup decoding
+    enable_prompt_lookup: bool = False
+    prompt_lookup_ngram: int = 3
+    prompt_lookup_max_draft: int = 4
+    prompt_lookup_min_ngram: int = 2
+
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
 

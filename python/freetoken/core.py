@@ -70,9 +70,12 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    prompt_len: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
+        if self.prompt_len == 0:
+            self.prompt_len = len(self.input_ids)
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len

@@ -411,6 +411,28 @@ def parse_args(
         help="Print one decode scheduler status line every N decode forwards.",
     )
 
+    parser.add_argument(
+        "--enable-prompt-lookup",
+        "--prompt-lookup",
+        action="store_true",
+        default=ServerArgs.enable_prompt_lookup,
+        help="Enable Prompt Lookup Decoding (speculative n-gram drafting from prompt).",
+    )
+
+    parser.add_argument(
+        "--prompt-lookup-ngram",
+        type=_positive_int,
+        default=ServerArgs.prompt_lookup_ngram,
+        help="N-gram window size for prompt lookup matching (default: 3).",
+    )
+
+    parser.add_argument(
+        "--prompt-lookup-max-draft",
+        type=_positive_int,
+        default=ServerArgs.prompt_lookup_max_draft,
+        help="Maximum number of speculative tokens to draft via prompt lookup (default: 4).",
+    )
+
     kv_capacity_group = parser.add_mutually_exclusive_group()
     kv_capacity_group.add_argument(
         "--num-pages",

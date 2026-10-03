@@ -22,6 +22,10 @@ class DraftCandidate:
     def is_empty(self) -> bool:
         return len(self.draft_tokens) == 0
 
+    @property
+    def has_draft(self) -> bool:
+        return len(self.draft_tokens) > 0
+
 
 class BaseDraftProvider(ABC):
     """Abstract interface for draft token providers (Strategy pattern).

@@ -407,6 +407,9 @@ class Scheduler(SchedulerIOMixin):
                     finish_reason = None
                     matched_stop = None
 
+                    old_cached_len = req.cached_len
+                    req.input_ids = req._ids_buf[: old_cached_len]
+
                     for tok_idx, tok in enumerate(tokens_to_emit):
                         tok_tensor = torch.tensor([tok], dtype=torch.int32)
                         req.append_host(tok_tensor)
@@ -432,7 +435,6 @@ class Scheduler(SchedulerIOMixin):
                             m = min(m, tok_idx)
                             break
 
-                    old_cached_len = req.cached_len
                     accepted_len = old_cached_len + len(tokens_to_emit)
                     page_size = self.config.page_size
 
@@ -769,16 +771,16 @@ class Scheduler(SchedulerIOMixin):
                     f"GDN bank: resuming req {req.uid} from host slot {host}")
 
     def _free_req_resources(self, req: Req) -> None:
+        logger.info_rank0(
+            f"[_FREE_REQ] uid={req.uid}, table_idx={req.table_idx}, cached_len={req.cached_len}, "
+            f"free_pages_before={len(self.cache_manager.free_slots)}"
+        )
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
         # abort in the same overlap iteration races _process_last_data and would free it twice --
         # double-freeing its table_idx and (hybrid) GDN slots onto the free-list, handing the same
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
-        logger.info_rank0(
-            f"[_FREE_REQ] uid={req.uid}, table_idx={req.table_idx}, cached_len={req.cached_len}, "
-            f"free_pages_before={len(self.cache_manager.free_slots)}"
-        )
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -1039,7 +1041,6 @@ class Scheduler(SchedulerIOMixin):
                 req._ids_buf[req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu
                 self.token_pool[req.table_idx, req.cached_len + 1 : req.cached_len + 1 + k] = draft_tensor_cpu.to(self.device)
                 req.device_len = req.cached_len + 1 + k
-                req.input_ids = req._ids_buf[: req.device_len]
 
                 if self._spec_backup_slot is not None and req.linear_slot_idx is not None:
                     self.engine.linear_state_pool.copy_from(req.linear_slot_idx, self._spec_backup_slot)

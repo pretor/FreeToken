@@ -804,6 +804,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-preseed",
+        action=argparse.BooleanOptionalAction,
+        dest="moe_preseed",
+        default=ServerArgs.moe_preseed,
+        help=(
+            "Pre-seed the hit region of the MoE cache at startup to accelerate "
+            "prefill (with --moe-prefill-hit-d2d) and warm initial decode steps."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

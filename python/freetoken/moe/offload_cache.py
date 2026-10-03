@@ -288,6 +288,9 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._chunk_hit_rows = 0
+        self._chunk_total_rows = 0
+        self._preseeded = False
         if self.prefill_hit_d2d:
             self._resolve_batch_memcpy()
 
@@ -534,6 +537,8 @@ class OffloadMoeCache:
             self.prefill_overlap = False
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+        if getattr(self, "_preseeded", False):
+            self.preseed()
 
     def set_alphas(
         self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
@@ -553,6 +558,58 @@ class OffloadMoeCache:
         assert gate_up_alpha.shape == down_alpha.shape == (total,)
         self.gate_up_alpha = gate_up_alpha.to(self.device)
         self.down_alpha = down_alpha.to(self.device)
+
+    def preseed(self) -> int:
+        """Pre-seed the hit region of the GPU slot cache [2*E, cache_size) with experts from bank_sources.
+
+        Equally partitions available slots across all layers.
+        When prefill-hit-d2d is active, these resident experts are gathered D2D directly within VRAM,
+        cutting PCIe transfers by up to (available_slots / total_model_experts)%.
+        Initializes usage to 1 so decode LRU can naturally evict them if needed.
+        """
+        if not self.banks:
+            return 0
+        E = self.num_experts
+        start_slot = 2 * E
+        total_slots = self.cache_size - start_slot
+        if total_slots <= 0:
+            return 0
+
+        experts_per_layer = min(E, total_slots // self.num_layers)
+        if experts_per_layer <= 0:
+            return 0
+
+        current_slot = start_slot
+        for layer_id in range(self.num_layers):
+            if layer_id in self._unpinned_layers:
+                continue
+            num_e = min(experts_per_layer, self.cache_size - current_slot)
+            if num_e <= 0:
+                break
+
+            for e in range(num_e):
+                slot = current_slot + e
+                self.slot_for_id[layer_id, e] = slot
+                self.id_of_slot[slot] = layer_id * E + e
+                self.usage[slot] = 1
+
+            for per_layer, cache in self.banks:
+                src = per_layer[layer_id][:num_e]
+                cache[current_slot : current_slot + num_e].copy_(src, non_blocking=True)
+
+            current_slot += num_e
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+        seeded_count = current_slot - start_slot
+        self._preseeded = True
+        logger.info_rank0(
+            f"MoE cache pre-seeded {seeded_count} experts across {self.num_layers} layers "
+            f"({experts_per_layer} experts/layer = {100.0 * experts_per_layer / E:.1f}% hit floor)"
+        )
+        return seeded_count
+
 
     def set_cpu_executor(self, executor) -> None:
         """Attach the CPU MoE executor (``decode_target`` in {"cpu", "hybrid"}).
@@ -648,6 +705,8 @@ class OffloadMoeCache:
         )
 
     def begin_prefill(self) -> None:
+        self._chunk_hit_rows = 0
+        self._chunk_total_rows = 0
         if not self.prefill_overlap:
             return
         self._prefill_buffer_layer = [None, None]
@@ -775,8 +834,17 @@ class OffloadMoeCache:
         E = self.num_experts
         snap = self._prefill_snapshot_np[layer_id]
         hit_mask = snap >= 2 * E
-        self.prefill_hit_rows += int(hit_mask.sum())
+        hits = int(hit_mask.sum())
+        self.prefill_hit_rows += hits
         self.prefill_total_rows += E
+        self._chunk_hit_rows += hits
+        self._chunk_total_rows += E
+        if layer_id == self.num_layers - 1 and self._chunk_total_rows > 0:
+            pct = 100.0 * self._chunk_hit_rows / self._chunk_total_rows
+            logger.info_rank0(
+                f"Prefill hit-D2D chunk: {self._chunk_hit_rows}/{self._chunk_total_rows} "
+                f"expert rows served via D2D ({pct:.1f}% hit rate)"
+            )
         if self._gather_dst_ptrs is not None:
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
@@ -897,6 +965,8 @@ class OffloadMoeCache:
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self._chunk_hit_rows = 0
+        self._chunk_total_rows = 0
         self.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()

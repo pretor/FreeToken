@@ -559,6 +559,13 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
+        if self.moe_offload_cache is not None:
+            preseed_enabled = (
+                config.moe_preseed if config.moe_preseed is not None else config.moe_prefill_hit_d2d
+            )
+            if preseed_enabled:
+                self.moe_offload_cache.preseed()
+
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
@@ -1455,6 +1462,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_preseed": False,
     "expert_load": "auto",
 }
 

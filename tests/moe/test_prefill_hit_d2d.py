@@ -151,3 +151,23 @@ def test_prefill_hit_d2d_noop_without_spare_slots():
     torch.cuda.synchronize()
     for view, (name, per_layer) in zip(views, sources.items()):
         assert torch.equal(view.cpu(), per_layer[0]), name
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_prefill_preseed():
+    cache, sources = _make_cache()
+    seeded = cache.preseed()
+    assert seeded == 6  # 3 layers * 2 experts
+    assert cache._preseeded
+    cache.begin_prefill()
+    assert cache._prefill_hit_d2d_active
+    for layer_id in range(NUM_LAYERS):
+        cache.prefetch_prefill_layer(layer_id)
+        views = cache.wait_prefill_layer(layer_id)
+        torch.cuda.synchronize()
+        for view, (name, per_layer) in zip(views, sources.items()):
+            assert torch.equal(view.cpu(), per_layer[layer_id]), f"Mismatch on {layer_id} {name}"
+        cache.release_prefill_layer(layer_id)
+    assert cache._chunk_hit_rows == 6

@@ -90,7 +90,7 @@ class DetokenizeManager:
         accumulated ids and text stay in ``decode_map`` for the life of the worker."""
         self.decode_map.pop(uid, None)
 
-    def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+    def _detokenize_step(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
@@ -116,7 +116,7 @@ class DetokenizeManager:
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
-            if len(new_text) > 0 and not new_text.endswith("�"):
+            if len(new_text) > 0 and not new_text.endswith("\ufffd"):
                 output_str = s.decoded_str + new_text
                 s.decoded_str = output_str
                 s.surr_offset = s.read_offset
@@ -145,3 +145,34 @@ class DetokenizeManager:
                 del self.decode_map[msg.uid]
 
         return incremental_strs
+
+    def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        if not msgs:
+            return []
+
+        uids = [m.uid for m in msgs]
+        if len(uids) == len(set(uids)):
+            return self._detokenize_step(msgs)
+
+        from collections import defaultdict
+        uid_indices: dict[int, list[int]] = defaultdict(list)
+        for idx, msg in enumerate(msgs):
+            uid_indices[msg.uid].append(idx)
+
+        out: List[str] = ["" for _ in msgs]
+        step = 0
+        while True:
+            step_indices: list[int] = []
+            for indices in uid_indices.values():
+                if step < len(indices):
+                    step_indices.append(indices[step])
+            if not step_indices:
+                break
+            step_indices.sort()
+            step_msgs = [msgs[i] for i in step_indices]
+            step_results = self._detokenize_step(step_msgs)
+            for idx, res in zip(step_indices, step_results, strict=True):
+                out[idx] = res
+            step += 1
+
+        return out

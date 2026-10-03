@@ -401,14 +401,24 @@ class Scheduler(SchedulerIOMixin):
                     from freetoken.speculative import SpeculativeVerifier
                     result = SpeculativeVerifier.verify_greedy(draft_tokens, preds)
 
-                    tokens_to_emit = result.all_tokens
                     m = result.num_accepted
+                    all_accepted = (m == k)
+
+                    if not all_accepted:
+                        # For hybrid GDN recurrent architecture: an all-or-nothing policy on drafts
+                        # guarantees bit-for-bit recurrent state equivalence without intra-chunk rewinds.
+                        tokens_to_emit = [preds[0]] if preds else []
+                        m = 0
+                    else:
+                        tokens_to_emit = result.all_tokens
+
                     finished = False
                     finish_reason = None
                     matched_stop = None
 
                     old_cached_len = req.cached_len
-                    req.input_ids = req._ids_buf[: old_cached_len]
+                    old_prefix_len = old_cached_len + 1
+                    req.input_ids = req._ids_buf[: old_prefix_len]
 
                     for tok_idx, tok in enumerate(tokens_to_emit):
                         tok_tensor = torch.tensor([tok], dtype=torch.int32)
@@ -451,18 +461,18 @@ class Scheduler(SchedulerIOMixin):
 
                     req.cached_len = accepted_len
                     req.device_len = req.cached_len + 1
-                    req.input_ids = req._ids_buf[: req.cached_len]
+                    req.input_ids = req._ids_buf[: req.device_len]
 
                     if not finished and len(tokens_to_emit) > 0:
                         self.token_pool[req.table_idx, req.cached_len] = tokens_to_emit[-1]
                         req._ids_buf[req.cached_len] = tokens_to_emit[-1]
 
-                    if m < k and self._spec_backup_slot is not None and req.linear_slot_idx is not None:
+                    if not all_accepted and self._spec_backup_slot is not None and req.linear_slot_idx is not None:
                         self.engine.linear_state_pool.copy_from(self._spec_backup_slot, req.linear_slot_idx)
 
                     logger.info_rank0(
                         f"[SPEC] verified: accepted={m}/{k}, emitted={len(tokens_to_emit)}, "
-                        f"pages_to_free={pages_to_free}, finished={finished}"
+                        f"pages_to_free={pages_to_free}, finished={finished} | draft={draft_tokens} preds={preds} emitted={tokens_to_emit}"
                     )
 
                     req.pending_draft = None

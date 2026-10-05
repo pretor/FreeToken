@@ -265,10 +265,11 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     """
     if world == 1:
         return t
-    # _shard_rows slices rows, not 128x128 scale blocks, so a block-fp8 dense build cannot be sharded here.
-    if name.endswith(".weight_scale_inv") or t.dtype in _FP8_DTYPES:
-        raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 dense weights, not block-fp8 ones")
-    if name.endswith(".self_attn.qkv_proj.weight"):
+    # 128x128 2D block-fp8 has float32 2D scale matrices where row slicing would cut across multi-row scale blocks.
+    # MXFP8 has uint8 1D per-row scales [N, K//32], so each row is completely independent.
+    if name.endswith(".weight_scale_inv") and t.dtype == torch.float32:
+        raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 or MXFP8 dense weights, not 128x128 block-fp8 ones")
+    if name.endswith((".self_attn.qkv_proj.weight", ".self_attn.qkv_proj.weight_scale_inv")):
         q = (config.num_qo_heads, 2 * config.head_dim)
         kv = (config.num_kv_heads, config.head_dim)
         return _shard_rows(t, [q, kv, kv], rank, world)
@@ -276,16 +277,20 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
         g = config.linear_attention_group()
         k = (g.num_key_heads, g.key_head_dim)
         v = (g.num_value_heads, g.value_head_dim)
-        if name.endswith(".in_proj.weight"):
+        if name.endswith((".in_proj.weight", ".in_proj.weight_scale_inv")):
             return _shard_rows(t, [k, k, v, v, (v[0], 1), (v[0], 1)], rank, world)
+        if name.endswith((".in_proj_qkvz.weight", ".in_proj_qkvz.weight_scale_inv")):
+            return _shard_rows(t, [k, k, v, v], rank, world)
+        if name.endswith((".in_proj_ba.weight", ".in_proj_ba.weight_scale_inv")):
+            return _shard_rows(t, [(v[0], 1), (v[0], 1)], rank, world)
         if name.endswith(".conv1d.weight"):
             return _shard_rows(t, [k, k, v], rank, world)
         if name.endswith((".A_log", ".dt_bias")):
             return _shard_rows(t, [(v[0], 1)], rank, world)
-        if name.endswith(".out_proj.weight"):
+        if name.endswith((".out_proj.weight", ".out_proj.weight_scale_inv")):
             return t.chunk(world, dim=1)[rank].clone()
         return t
-    if name.endswith(".shared_expert.gate_up_proj.weight"):
+    if name.endswith((".shared_expert.gate_up_proj.weight", ".shared_expert.gate_up_proj.weight_scale_inv")):
         half = t.shape[0] // 2
         return _shard_rows(t, [(half, 1), (half, 1)], rank, world)
     # o_proj / down_proj: dim 1; embed_tokens / lm_head: vocab rows; others unchanged.

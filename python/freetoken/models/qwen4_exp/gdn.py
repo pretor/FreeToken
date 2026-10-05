@@ -71,18 +71,15 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             self._local_conv_dim, self._local_value_dim,
             self._local_num_v_heads, self._local_num_v_heads,
         ]
-        # The split (quantized) branch has no TP-aware variant: its two linears are built from
-        # the checkpoint's own scheme and are not sharded here.
-        assert not (tp.size > 1 and self._split_in_proj), (
-            "qwen4_exp TP shards bf16 GDN projections only"
-        )
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
@@ -167,9 +164,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
 
         if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
-            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            conv_in, z = torch.split(qkvz, [self._local_conv_dim, self._local_value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b, a = torch.split(ba, [self._local_num_v_heads, self._local_num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)

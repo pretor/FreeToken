@@ -122,7 +122,7 @@ def test_pinned_nvfp4_gather_matches_reference():
                        ref[ids.reshape(-1).cpu()])
 
     oob = ids.clone()
-    oob[0] = torch.arange(-3, 5)
+    oob[0, :8] = torch.arange(-3, 5, device="cuda")
     out = table.lookup(oob)
-    assert torch.equal(out[0, :3], torch.zeros(3, HEAD_DIM, dtype=torch.bfloat16, device="cuda"))
-    assert torch.equal(out[0, 7], ref[oob[0, 7]].cuda())
+    assert torch.equal(out.reshape(-1, 16, HEAD_DIM)[0, :3], torch.zeros(3, HEAD_DIM, dtype=torch.bfloat16, device="cuda"))
+    assert torch.equal(out.reshape(-1, 16, HEAD_DIM)[0, 7], ref[oob[0, 7]].cuda())

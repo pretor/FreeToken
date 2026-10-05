@@ -267,8 +267,10 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
         return t
     # 128x128 2D block-fp8 has float32 2D scale matrices where row slicing would cut across multi-row scale blocks.
     # MXFP8 has uint8 1D per-row scales [N, K//32], so each row is completely independent.
-    if name.endswith(".weight_scale_inv") and t.dtype == torch.float32:
+    if name.endswith(".weight_scale_inv") and t.dtype != torch.uint8:
         raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 or MXFP8 dense weights, not 128x128 block-fp8 ones")
+    if name.endswith(".in_proj.weight") and t.dtype in _FP8_DTYPES:
+        raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 or split MXFP8 in_proj, not unsplit block-fp8 in_proj")
     if name.endswith((".self_attn.qkv_proj.weight", ".self_attn.qkv_proj.weight_scale_inv")):
         q = (config.num_qo_heads, 2 * config.head_dim)
         kv = (config.num_kv_heads, config.head_dim)

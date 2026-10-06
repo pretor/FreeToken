@@ -225,6 +225,20 @@ def load_weight(
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
     if is_ftw_checkpoint(model_path):
         weights = iter_ftw_weights(model_path, keep=keep)
+        from freetoken.distributed import get_tp_info
+        tp = get_tp_info()
+        if tp.size > 1:
+            _config, spec = _spec_for_model_path(model_path)
+            shard_fn = _model_override(spec, "_shard")
+            shard_vision_fn = _model_override(spec, "_shard_vision_tensor")
+            if shard_fn is not None:
+                def _sharded(base_iter):
+                    for name, tensor in base_iter:
+                        if name.startswith("visual.") and shard_vision_fn is not None:
+                            yield name, shard_vision_fn(name, tensor, tp.rank, tp.size)
+                        else:
+                            yield name, shard_fn(name, tensor, _config, tp.rank, tp.size)
+                weights = _sharded(weights)
     else:
         _config, spec = _spec_for_model_path(model_path)
         iter_weights = _load_attr(spec.module, spec.iter_weights)

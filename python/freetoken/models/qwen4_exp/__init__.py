@@ -12,6 +12,8 @@ Contracts shared across modules (do not rename):
 from .config import parse_config
 from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
+    _shard,
+    _shard_vision_tensor,
     ftw_side_files,
     nvfp4_expert_spec,
     iter_vision_weights,
@@ -30,6 +32,8 @@ __all__ = [
     "Qwen4ExpForConditionalGeneration",
     "iter_vision_weights",
     "iter_weights",
+    "_shard",
+    "_shard_vision_tensor",
     "load_ple_table",
     "parse_config",
     "iter_expert_pieces",

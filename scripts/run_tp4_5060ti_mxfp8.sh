@@ -15,7 +15,7 @@ FT_MEMORY_RATIO="${FT_MEMORY_RATIO:-0.95}"
 FT_MODEL_PATH="${FT_MODEL_PATH:-/models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW}"
 FT_SERVED_NAME="${FT_SERVED_NAME:-Qwen3.8-Flash-Next-NVFP4-QAD}"
 FT_PLE_BACKEND="${FT_PLE_BACKEND:-pinned}"
-FT_MOE_CACHE_SIZE="${FT_MOE_CACHE_SIZE:-14500}"
+FT_MOE_CACHE_SIZE="${FT_MOE_CACHE_SIZE:-15000}"
 
 echo "=== launching ft serve (TP4) on gpus $FT_GIFS, port $FT_PORT, memory-ratio $FT_MEMORY_RATIO ==="
 echo "ft: $FT_MODEL_PATH | quant moe.nvfp4=triton | ple $FT_PLE_BACKEND | moe offload | cache-size $FT_MOE_CACHE_SIZE | tokens 180032"
@@ -43,6 +43,7 @@ exec numactl --interleave=all "$FREETOKEN_VENV/bin/ft" serve \
   --tp-size 4 --gpu "$FT_GIFS" \
   --moe-strategy offload --quant-backend moe.nvfp4=triton \
   --ple-backend "$FT_PLE_BACKEND" --expert-load serial \
+  --embed-device cpu \
   --moe-cache-size "$FT_MOE_CACHE_SIZE" --memory-ratio "$FT_MEMORY_RATIO" \
   --moe-prefill-hit-d2d --kv-cache-dtype fp8 \
   --num-tokens 180032 --max-seq-len-override 180032 --kv-reserve-tokens 180032 \

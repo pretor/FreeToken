@@ -469,6 +469,52 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
     return bank_entries, alpha_entries, flat_entries, per_layer_groups
 
 
+def _get_sharded_bank_shape(name: str, shape: list[int] | tuple[int, ...], tp_rank: int, tp_size: int) -> tuple[int, ...]:
+    if tp_size <= 1:
+        return tuple(shape)
+    from freetoken.moe.legacy_format import canonical_role
+    role = canonical_role(name)
+    num_experts = shape[0]
+    if role in ("gate_up", "gate_up_scale", "gate_up_global"):
+        total_rows = shape[1]
+        inter = total_rows // 2
+        local_inter = inter // tp_size
+        new_rows = 2 * local_inter
+        return (num_experts, new_rows, *shape[2:])
+    elif role in ("down", "down_scale"):
+        total_cols = shape[2]
+        local_cols = total_cols // tp_size
+        return (num_experts, shape[1], local_cols)
+    elif role == "down_global":
+        return tuple(shape)
+    else:
+        return tuple(shape)
+
+
+def _copy_sharded_bank(name: str, bank_tensor, full_tensor, tp_rank: int, tp_size: int):
+    if tp_size <= 1:
+        bank_tensor.copy_(full_tensor)
+        return
+    from freetoken.moe.legacy_format import canonical_role
+    role = canonical_role(name)
+    if role in ("gate_up", "gate_up_scale", "gate_up_global"):
+        total_rows = full_tensor.shape[1]
+        inter = total_rows // 2
+        local_inter = inter // tp_size
+        gate_slice = slice(tp_rank * local_inter, (tp_rank + 1) * local_inter)
+        up_slice = slice(inter + tp_rank * local_inter, inter + (tp_rank + 1) * local_inter)
+        bank_tensor[:, :local_inter].copy_(full_tensor[:, gate_slice])
+        bank_tensor[:, local_inter:].copy_(full_tensor[:, up_slice])
+    elif role in ("down", "down_scale"):
+        local_cols = full_tensor.shape[2] // tp_size
+        col_slice = slice(tp_rank * local_cols, (tp_rank + 1) * local_cols)
+        bank_tensor.copy_(full_tensor[:, :, col_slice])
+    elif role == "down_global":
+        bank_tensor.copy_(full_tensor)
+    else:
+        bank_tensor.copy_(full_tensor)
+
+
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
@@ -507,6 +553,10 @@ def load_ftw_banks(
     )
     from freetoken.utils.progress import byte_bar
 
+    from freetoken.distributed import try_get_tp_info
+    tp = try_get_tp_info()
+    tp_size = tp.size if tp is not None else 1
+    tp_rank = tp.rank if tp is not None else 0
     residency = layer_residency or [HostResidency.PINNED.value] * num_layers
     assert len(residency) == num_layers, (len(residency), num_layers)
 
@@ -568,7 +618,8 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            bank_shape = _get_sharded_bank_shape(base, e["shape"], tp_rank, tp_size)
+            bank = HostBank(bank_shape, _dtype_of(e["dtype"]), backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
@@ -597,7 +648,29 @@ def load_ftw_banks(
 
             def _read_layer(job):
                 _name, bank, entry, layer_id = job
-                reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                if tp_size > 1:
+                    import warnings
+                    pieces = list(reader._pieces(entry["global_off"], entry["nbytes"]))
+                    assert len(pieces) == 1, f"entry {entry['name']} spans {len(pieces)} shards"
+                    file, file_off, _, length = pieces[0]
+                    mv = reader._map(file)
+                    entry_mv = mv[file_off : file_off + length]
+                    dtype = _dtype_of(entry["dtype"])
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        full = torch.frombuffer(
+                            entry_mv, dtype=dtype, count=entry["nbytes"] // _elsize(dtype)
+                        ).view(*entry["shape"])
+                        _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
+                    del full
+                    m_tuple = reader._maps.get(file)
+                    if m_tuple is not None:
+                        try:
+                            m_tuple[0].madvise(mmap.MADV_DONTNEED, file_off, length)
+                        except (AttributeError, OSError):
+                            pass
+                else:
+                    reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 

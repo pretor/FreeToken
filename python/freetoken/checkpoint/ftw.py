@@ -293,8 +293,14 @@ class FTWReader:
             os.close(fd)
         self._fds.clear()
         for m, mv in self._maps.values():
-            mv.release()
-            m.close()
+            try:
+                mv.release()
+            except BufferError:
+                pass
+            try:
+                m.close()
+            except BufferError:
+                pass
         self._maps.clear()
 
     def _pieces(self, global_off: int, nbytes: int):
@@ -663,6 +669,10 @@ def load_ftw_banks(
                         ).view(*entry["shape"])
                         _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
                     del full
+                    try:
+                        entry_mv.release()
+                    except BufferError:
+                        pass
                     m_tuple = reader._maps.get(file)
                     if m_tuple is not None:
                         try:

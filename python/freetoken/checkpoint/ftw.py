@@ -497,6 +497,7 @@ def _get_sharded_bank_shape(name: str, shape: list[int] | tuple[int, ...], tp_ra
         return tuple(shape)
 
 
+@torch.inference_mode()
 def _copy_sharded_bank(name: str, bank_tensor, full_tensor, tp_rank: int, tp_size: int):
     if tp_size <= 1:
         bank_tensor.copy_(full_tensor)
@@ -653,36 +654,37 @@ def load_ftw_banks(
                 bar.update(layer_bytes)
 
             def _read_layer(job):
-                _name, bank, entry, layer_id = job
-                if tp_size > 1:
-                    import warnings
-                    pieces = list(reader._pieces(entry["global_off"], entry["nbytes"]))
-                    assert len(pieces) == 1, f"entry {entry['name']} spans {len(pieces)} shards"
-                    file, file_off, _, length = pieces[0]
-                    mv = reader._map(file)
-                    entry_mv = mv[file_off : file_off + length]
-                    dtype = _dtype_of(entry["dtype"])
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        full = torch.frombuffer(
-                            entry_mv, dtype=dtype, count=entry["nbytes"] // _elsize(dtype)
-                        ).view(*entry["shape"])
-                        _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
-                    del full
-                    try:
-                        entry_mv.release()
-                    except BufferError:
-                        pass
-                    m_tuple = reader._maps.get(file)
-                    if m_tuple is not None:
+                with torch.inference_mode():
+                    _name, bank, entry, layer_id = job
+                    if tp_size > 1:
+                        import warnings
+                        pieces = list(reader._pieces(entry["global_off"], entry["nbytes"]))
+                        assert len(pieces) == 1, f"entry {entry['name']} spans {len(pieces)} shards"
+                        file, file_off, _, length = pieces[0]
+                        mv = reader._map(file)
+                        entry_mv = mv[file_off : file_off + length]
+                        dtype = _dtype_of(entry["dtype"])
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            full = torch.frombuffer(
+                                entry_mv, dtype=dtype, count=entry["nbytes"] // _elsize(dtype)
+                            ).view(*entry["shape"])
+                            _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
+                        del full
                         try:
-                            m_tuple[0].madvise(mmap.MADV_DONTNEED, file_off, length)
-                        except (AttributeError, OSError):
+                            entry_mv.release()
+                        except BufferError:
                             pass
-                else:
-                    reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
-                pins.submit(bank, residency[layer_id])
-                bar.update(entry["nbytes"])
+                        m_tuple = reader._maps.get(file)
+                        if m_tuple is not None:
+                            try:
+                                m_tuple[0].madvise(mmap.MADV_DONTNEED, file_off, length)
+                            except (AttributeError, OSError):
+                                pass
+                    else:
+                        reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                    pins.submit(bank, residency[layer_id])
+                    bar.update(entry["nbytes"])
 
             with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
                 futures = [ex.submit(_read_alpha, e) for e in alpha_entries]

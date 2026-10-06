@@ -51,7 +51,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             and isinstance(se.down_proj, LinearRowParallel)
             and isinstance(ex, OffloadMoELayer)
         ):
-            shared = F.linear(silu_and_mul(se.gate_up_proj.forward(hidden_states)), se.down_proj.weight)
+            act = silu_and_mul(se.gate_up_proj.forward(hidden_states))
+            shared = se.down_proj.quant_method.apply(se.down_proj, act)
             if get_global_ctx().batch.is_prefill:
                 routed = ex.prefill_forward(hidden_states, router_logits)
             else:

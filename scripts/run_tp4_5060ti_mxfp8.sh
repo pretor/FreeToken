@@ -18,7 +18,7 @@ FT_PLE_BACKEND="${FT_PLE_BACKEND:-pinned}"
 FT_MOE_CACHE_SIZE="${FT_MOE_CACHE_SIZE:-15000}"
 
 echo "=== launching ft serve (TP4) on gpus $FT_GIFS, port $FT_PORT, memory-ratio $FT_MEMORY_RATIO ==="
-echo "ft: $FT_MODEL_PATH | quant moe.nvfp4=triton | ple $FT_PLE_BACKEND | moe offload | cache-size $FT_MOE_CACHE_SIZE | tokens 180032"
+echo "ft: $FT_MODEL_PATH | quant moe.nvfp4=triton | ple $FT_PLE_BACKEND | moe offload | cache-size $FT_MOE_CACHE_SIZE | tokens 200000"
 
 cd "$FREETOKEN_ROOT"
 export CUDA_HOME="$CUDA_HOME_DIR"
@@ -46,7 +46,7 @@ exec numactl --interleave=all "$FREETOKEN_VENV/bin/ft" serve \
   --embed-device cpu \
   --moe-cache-size "$FT_MOE_CACHE_SIZE" --memory-ratio "$FT_MEMORY_RATIO" \
   --moe-prefill-hit-d2d --kv-cache-dtype fp8 \
-  --num-tokens 180032 --max-seq-len-override 180032 --kv-reserve-tokens 180032 \
+  --num-tokens 200000 --max-seq-len-override 200000 --kv-reserve-tokens 200000 \
   --max-running-requests 2 --cuda-graph-max-bs 2 --max-extend-length 4096 --mamba-host-slots 32 \
   --served-model-name "$FT_SERVED_NAME" \
   --text-model-only \

@@ -86,7 +86,7 @@ class HostBank:
     __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, shm_path: str | None = None):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
@@ -96,7 +96,16 @@ class HostBank:
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        if backing == "cuda":
+        if shm_path is not None:
+            fd = os.open(shm_path, os.O_RDWR | os.O_CREAT, 0o666)
+            if os.fstat(fd).st_size < asize:
+                os.ftruncate(fd, asize)
+            self._buf = mmap.mmap(fd, asize, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            os.close(fd)
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
+        elif backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
             # direct-IO readers need page alignment, but cudaHostAlloc only guarantees ~512 in practice

@@ -526,25 +526,48 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     if scalar is None:
         raise ValueError("PLE table has no global weight_scale")
 
-    bank = HostBank((expected * rows, cols), torch.uint8 if packed else torch.float8_e4m3fn)
-    scale_bank = HostBank((expected * rows, cols // 8), torch.float8_e4m3fn) if packed else None
+    tp = get_tp_info()
+    use_shm = tp.size > 1 and os.path.exists("/dev/shm")
+    shm_w = f"/dev/shm/ft_ple_weight_{rows}_{cols}.bin" if use_shm else None
+    shm_s = f"/dev/shm/ft_ple_scale_{rows}_{cols}.bin" if use_shm and packed else None
+    flag = f"/dev/shm/ft_ple_ready_{rows}_{cols}.flag" if use_shm else None
+    is_primary = tp.rank == 0 if use_shm else True
+
+    if use_shm and is_primary and os.path.exists(flag):
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+
+    bank = HostBank((expected * rows, cols), torch.uint8 if packed else torch.float8_e4m3fn, shm_path=shm_w)
+    scale_bank = HostBank((expected * rows, cols // 8), torch.float8_e4m3fn, shm_path=shm_s) if packed else None
     shard_bytes = rows * cols
     scale_bytes = rows * (cols // 8)
-    bar = byte_bar(expected * (shard_bytes + (scale_bytes if packed else 0)), "Loading PLE table")
-    jobs = [(parts, bank, shard_bytes)]
-    if packed:
-        jobs.append((scale_parts, scale_bank, scale_bytes))
-    try:
-        for src, dst, nbytes in jobs:
-            buf = dst.memoryview()
-            for shard in range(expected):
-                path, offset, n = src[shard]
-                assert n == nbytes, f"PLE shard {shard} is {n} B, expected {nbytes}"
-                read_range_into(buf, path, file_offset=offset, nbytes=n,
-                                dest_offset=shard * nbytes, workers=workers, chunk=chunk)
-                bar.update(n)
-    finally:
-        bar.close()
+
+    if is_primary:
+        bar = byte_bar(expected * (shard_bytes + (scale_bytes if packed else 0)), "Loading PLE table")
+        jobs = [(parts, bank, shard_bytes)]
+        if packed:
+            jobs.append((scale_parts, scale_bank, scale_bytes))
+        try:
+            for src, dst, nbytes in jobs:
+                buf = dst.memoryview()
+                for shard in range(expected):
+                    path, offset, n = src[shard]
+                    assert n == nbytes, f"PLE shard {shard} is {n} B, expected {nbytes}"
+                    read_range_into(buf, path, file_offset=offset, nbytes=n,
+                                    dest_offset=shard * nbytes, workers=workers, chunk=chunk)
+                    bar.update(n)
+        finally:
+            bar.close()
+        if use_shm:
+            with open(flag, "w") as f:
+                f.write("ready")
+    else:
+        import time
+        while not os.path.exists(flag):
+            time.sleep(0.5)
+
     if pin and torch.cuda.is_available():
         bank.pin()
         if scale_bank is not None:

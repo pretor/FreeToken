@@ -41,6 +41,7 @@ class StatsTracker:
         self.decode_tokens_total = 0
         self._admitted_at: dict[int, float] = {}
         self._last_output_at: dict[int, float] = {}
+        self._prefilling: dict[int, int] = {}
         self.kv_used_pages = 0
         self.kv_total_pages = 0
         self.mamba_used_slots = 0
@@ -66,6 +67,7 @@ class StatsTracker:
     def on_abort(self, uid: int) -> None:
         if uid in self._inflight:
             self._aborting.add(uid)
+        self._prefilling.pop(uid, None)
 
     def observe(self, reply: Any, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
@@ -77,6 +79,8 @@ class StatsTracker:
         if getattr(reply, "prompt_tokens_delta", 0) > 0:
             self._prefill.append((t, reply.prompt_tokens_delta))
             self.prompt_tokens_total += reply.prompt_tokens_delta
+            if uid is not None:
+                self._prefilling[uid] = reply.prompt_tokens_delta
         if getattr(reply, "cached_tokens", 0) > 0:
             self.cached_prompt_tokens_total += reply.cached_tokens
         if getattr(reply, "kv_total_pages", 0) > 0:  # ignore 0/0 (prompt reply, owned-KV)
@@ -93,6 +97,7 @@ class StatsTracker:
         if getattr(reply, "finished", False):
             self._admitted_at.pop(uid, None)
             self._last_output_at.pop(uid, None)
+            self._prefilling.pop(uid, None)
             if uid in self._inflight:
                 self._inflight.discard(uid)
                 if uid in self._aborting:
@@ -105,6 +110,7 @@ class StatsTracker:
         if last is None:
             # The first output reply ends prefill. Tokens riding on it (overlap can deliver
             # several) were measured by no decode interval, so they are not decode work.
+            self._prefilling.pop(uid, None)
             admitted = self._admitted_at.pop(uid, None)
             if admitted is not None:
                 self.prefill_seconds_total += max(0.0, t - admitted)
@@ -128,6 +134,13 @@ class StatsTracker:
         return self._rate(self._decode, now)
 
     def prefill_tps(self, now: float | None = None) -> float:
+        if self._prefilling:
+            t = time.monotonic() if now is None else now
+            active_rates = [
+                toks / max(0.1, t - self._admitted_at.get(uid, t))
+                for uid, toks in self._prefilling.items()
+            ]
+            return sum(active_rates)
         return self._rate(self._prefill, now)
 
 
@@ -158,7 +171,7 @@ def _swa_page_size(config: Any) -> int:
     return 1
 
 
-def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
+def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int, now: float | None = None) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
     pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
@@ -194,8 +207,10 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
-            "decode_tps": round(tr.decode_tps(), 1),
-            "prefill_tps": round(tr.prefill_tps(), 1),
+            "decode_tps": round(tr.decode_tps(now), 1),
+            "prefill_tps": round(tr.prefill_tps(now), 1),
+            "prefill_active": bool(tr._prefilling),
+            "prefill_tokens_in_flight": sum(tr._prefilling.values()),
         },
         "requests": {
             "active": tr.active,

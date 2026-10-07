@@ -93,7 +93,7 @@ def test_stats_document_publishes_the_timing_totals():
         ),
     )
 
-    requests = build_stats(state, p95_ms=0, ttft_mean_ms=0)["requests"]
+    requests = build_stats(state, p95_ms=0, ttft_mean_ms=0, now=12.0)["requests"]
 
     assert requests["prompt_tokens_total"] == 10
     assert requests["cached_prompt_tokens_total"] == 4
@@ -101,3 +101,30 @@ def test_stats_document_publishes_the_timing_totals():
     assert requests["decode_tokens_total"] == 1
     assert requests["prefill_seconds_total"] == pytest.approx(0.25)
     assert requests["decode_seconds_total"] == pytest.approx(0.5)
+
+
+def test_prefill_active_tracks_in_flight_tokens_and_live_throughput():
+    tr = StatsTracker()
+    tr.on_new_user(42, now=10.0)
+    tr.observe(reply(42, prompt=4000), now=10.0)
+    assert tr._prefilling[42] == 4000
+    # While in prefill at t=12.0s (elapsed 2.0s), rate is 4000 / 2.0 = 2000.0 tok/s
+    assert tr.prefill_tps(now=12.0) == pytest.approx(2000.0)
+    state = SimpleNamespace(
+        stats=tr,
+        config=SimpleNamespace(
+            served_model_name="m",
+            max_seq_len=4096,
+            served_modalities=set(),
+            model_config=SimpleNamespace(),
+        ),
+    )
+    s = build_stats(state, p95_ms=0, ttft_mean_ms=0, now=12.0)
+    assert s["throughput"]["prefill_active"] is True
+    assert s["throughput"]["prefill_tokens_in_flight"] == 4000
+    assert s["throughput"]["prefill_tps"] == pytest.approx(2000.0, abs=0.1)
+
+    # First output arrives at t=12.5s -> prefill ends
+    tr.observe(reply(42, completion=1), now=12.5)
+    assert not tr._prefilling
+    assert tr.prefill_seconds_total == pytest.approx(2.5)

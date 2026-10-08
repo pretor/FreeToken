@@ -37,6 +37,8 @@ class EngineConfig:
     # --embed-device: "cpu" keeps the untied input-embedding table in pinned host RAM, read by
     # the GPU in place over PCIe (a few rows per decode step); its VRAM goes to the KV pool.
     embed_device: str = "gpu"
+    # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
+    # prompt's last window; "exact" runs them on every token.
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the

@@ -204,6 +204,8 @@ def parse_args(
             return "qwen3_coder"
         if "qwen" in marker:
             return "qwen25"
+        if "deepseek_v41" in marker or "deepseekv41" in marker:
+            return "deepseekv41"
         if "deepseek" in marker and ("v4" in marker or "deepseek_v4" in marker):
             return "deepseekv32"
         if "deepseek" in marker and ("v3.2" in marker or "v32" in marker):
@@ -629,6 +631,7 @@ def parse_args(
             "qwen3_coder",
             "mistral",
             "deepseekv32",
+            "deepseekv41",
             "gemma4",
             "glm47",
             "minimax",
@@ -706,6 +709,17 @@ def parse_args(
             "Where the input-embedding table lives. 'cpu' keeps it in pinned host RAM and the "
             "GPU reads the looked-up rows over PCIe, freeing its VRAM for the KV cache (e.g. "
             "2.4 GiB on a 248k-vocab, 5120-wide model). Tables tied to the LM head stay on the GPU."
+        ),
+    )
+
+    parser.add_argument(
+        "--swa-decoder-replay",
+        default=ServerArgs.swa_decoder_replay,
+        choices=["bounded", "exact"],
+        help=(
+            "DeepSeek-V4.1 Decoder SWA Bounded Replay. 'bounded' (default) runs the 20 decoder layers "
+            "on each prompt's last 128 tokens with their sliding window truncated there, as in the "
+            "tech report; 'exact' runs them on every prompt token (the reference numerics)."
         ),
     )
 

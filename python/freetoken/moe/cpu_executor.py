@@ -171,6 +171,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        act_block: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -323,6 +324,11 @@ class CpuMoeExecutor:
         # the C++ side to skip its own. Measured on DeepSeek-V4-Flash bs=1 decode:
         # 12.85 -> 15.65 tok/s, output bit-identical (tests/moe/test_dsfp4_prequant.py).
         self._gpu_prequant = fmt == "ds_fp4" and device.type == "cuda"
+        # the W4A8 activation round-trip block follows the checkpoint's fp8 block (128 on V4, 32 on V4.1)
+        self._act_block = act_block
+        if fmt == "ds_fp4":
+            assert act_block is not None, "ds_fp4 experts need act_block, the checkpoint's fp8 activation quant block"
+            self._ext.set_act_block(act_block)
         if self._gpu_prequant:
             self._ext.set_input_prequant(True)
             logger.info_rank0(
@@ -482,7 +488,7 @@ class CpuMoeExecutor:
         """DeepSeek-V4 ``ds_fp4`` schema: row-major e2m1 (2/byte) + e8m0 per-32 block
         scales, no global, no bias. Layout matches nvfp4 (K contiguous per output row),
         so the C++ GEMV reads it in place. The kernel additionally FP8-round-trips the
-        activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
+        activations (the checkpoint's fp8 block) to match the DeepSeek W4A8 reference."""
         gup, gus = banks["gate_up"], banks["gate_up_scale"]
         dnp, dns = banks["down"], banks["down_scale"]
         assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
@@ -490,7 +496,7 @@ class CpuMoeExecutor:
         I = int(gup[0].shape[1] // 2)
         H = int(gup[0].shape[2] * 2)
         assert gup[0].shape[1] == 2 * I
-        assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
+        assert H % 32 == 0 and I % 32 == 0, (H, I)  # e8m0 scales per 32 along K
         assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
         assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
         assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
@@ -580,7 +586,7 @@ class CpuMoeExecutor:
             # pre-quantized activations and skips its serial scalar pass.
             from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
 
-            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
+            hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
 
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)

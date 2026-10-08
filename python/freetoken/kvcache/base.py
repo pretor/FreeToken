@@ -70,6 +70,14 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     )
 
 
+@dataclass(frozen=True)
+class WindowPoolSpec:
+    """Window resize units and minimum usable capacity, excluding reserved pages."""
+
+    page_size: int
+    min_pages: int
+
+
 class BaseKVCachePool(ABC):
     """
     Base class for key-value caches.
@@ -85,6 +93,15 @@ class BaseKVCachePool(ABC):
     # quantized allocation/store/scale-view trio stays at "none"; create_kv_pool rejects a
     # quantization the family does not implement, so nothing here is ever silently ignored.
     kv_quant: str = "none"
+
+    @classmethod
+    def window_spec(cls, config) -> WindowPoolSpec | None:
+        return None
+
+    @property
+    def window_pages(self) -> int:
+        """Current usable window pages in the units declared by window_spec."""
+        return 0
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family

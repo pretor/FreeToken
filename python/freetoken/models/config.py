@@ -205,7 +205,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     """DSV4 sparse attention (window + compressed tiers + Lightning Indexer). Standalone
     class on purpose: subclassing SWAAttentionGroupConfig would flip has_swa_attention
     and reroute DSV4 through the SWA gates. Geometry beyond the latent width lives in
-    dsv4_args; the pool prices itself from there, not from this spec."""
+    dsv4_args (``dsv41_args`` for the ``v41`` variant); the pool prices itself from there,
+    not from this spec."""
 
     kind: ClassVar[Literal["dsv4"]] = "dsv4"
     cache_kind: ClassVar[Literal["dsv4_paged"]] = "dsv4_paged"
@@ -213,6 +214,8 @@ class DSV4AttentionGroupConfig(BaseAttentionGroupConfig):
     num_kv_heads: int
     head_dim: int
     sliding_window: int  # the P-token window page
+    # "v41": DeepSeek-V4.1's cross-layer-shared packed tiers (AttnType.DSV41, its own pool and backend)
+    variant: Literal["v4", "v41"] = "v4"
 
 
 AttentionGroupConfig: TypeAlias = (
@@ -327,6 +330,9 @@ class ModelConfig:
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
     dsv4_args: Any | None = None
+    # DeepSeek-V4.1 payload (DeepseekV41Args): DSV41 layer roles, Engram, replay policy. Opaque
+    # to model-agnostic engine code; None for every other model.
+    dsv41_args: Any | None = None
     # GLM-5.2 (glm_moe_dsa) MLA/DSA payload (GlmMoeDsaArgs): the MLA low-rank dims and the
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
@@ -448,7 +454,7 @@ class ModelConfig:
         if isinstance(group, SWAAttentionGroupConfig):
             return AttnType.SWA
         if isinstance(group, DSV4AttentionGroupConfig):
-            return AttnType.DSV4
+            return AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4
         return _full_group_attn_type(group)
 
     def kv_cache_group_specs(self) -> Tuple[KVCacheGroupSpec, ...]:
@@ -502,7 +508,7 @@ class ModelConfig:
                         num_kv_heads=group.num_kv_heads,
                         head_dim=group.head_dim,
                         sliding_window=group.sliding_window,
-                        attn_type=AttnType.DSV4,
+                        attn_type=AttnType.DSV41 if group.variant == "v41" else AttnType.DSV4,
                     )
                 )
         return tuple(specs)

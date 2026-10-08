@@ -28,6 +28,8 @@ class MoEConfig:
     beta: float = 0.0
     limit: float | None = None
     interleaved: bool = False
+    # dynamic fp8 activation quant block of a W4A8 expert kernel, set by the quant dialect; None = no activation quant
+    act_block: int | None = None
     has_bias: bool = False
     apply_router_weight_on_input: bool = False
     strategy: str = "resident"
@@ -138,6 +140,10 @@ class MoEKernel(ABC):
     name: ClassVar[str]
     cpu_format: ClassVar[str | None] = None
     max_slots: ClassVar[int | None] = None
+    # Whether ``apply`` treats a slot of -1 as an inactive route (zero output, no read of any slot).
+    # Hybrid decode hands the GPU a route split with such holes; kernels without this get the holes
+    # pointed at slot 0 with weight 0 (slot storage is zero-filled at allocation, so that is exact).
+    supports_inactive_slots: ClassVar[bool] = False
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         return None

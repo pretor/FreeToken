@@ -9,6 +9,86 @@
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
+## This Fork: 4x RTX 5060 Ti & Consumer Multi-GPU Optimization
+
+This fork by **[@pretor](https://github.com/pretor)** is specifically engineered and battle-tested for high-throughput serving of frontier MoE architectures on consumer multi-GPU workstations (specifically **4x NVIDIA GeForce RTX 5060 Ti 16GB** over PCIe 4.0, without NVLink or P2P).
+
+### What This Fork Adds (Beyond Upstream `main`):
+
+1. **MXFP8 Tensor-Parallel (TP) Weight Sharding (by @pretor)**:
+   - **Custom Implementation**: Created and integrated full Tensor-Parallel (TP4) row/column weight sharding for **MXFP8** dense layers, merger projections, and shared experts.
+   - **Why It Matters**: Upstream FreeToken only supported single-GPU (TP=1) or duplicated layouts for MXFP8 weights. This sharding allows modern hybrid checkpoints—which pair NVFP4 routed experts with MXFP8 shared experts—to partition weights cleanly across 4 GPUs, saving precious VRAM and unlocking true multi-GPU scaling.
+
+2. **Vision Tower TP Sharding (Multi-Modal Acceleration)**:
+   - Shards vision encoder weights across all TP ranks (`_shard_vision_tensor`), dividing ViT memory to only **~214 MB per GPU** instead of duplicating 856 MB on every card or crashing under TP > 1.
+
+3. **Pre-Merged Cutting-Edge Upstream PRs**:
+   - **[PR #635](https://github.com/FlashML-org/FreeToken/pull/635)**: `perf(moe): avoid intra-op fanout while filling NVFP4 host banks` — eliminates intra-op fanout latency when populating host-side NVFP4 expert banks.
+   - **[PR #636](https://github.com/FlashML-org/FreeToken/pull/636)**: `feat(quant): opt-in fp8-block QAT for the lm_head` — enables FP8-block quantized LM heads to conserve GPU memory.
+   - **[PR #639](https://github.com/FlashML-org/FreeToken/pull/639)**: `feat(server): add --api-key authentication` — adds `--api-key` and `$FREETOKEN_API_KEY` bearer authentication to protect the server endpoint.
+
+4. **Production Stability & 200k Context Resilience**:
+   - Custom timeout flags (`--step-timeout 120`, `--distributed-timeout 2592000`) that prevent NCCL heartbeat and rendezvous timeouts during long idle stretches or heavy prefill batches.
+   - Production-verified **FP8 KV-Cache** across up to **200,000 tokens** (~1.31 GiB VRAM per GPU for 200k tokens).
+
+---
+
+### Tested & Verified Models:
+
+These models have been tested and run at full speed on this fork:
+
+1. **[local-inference-lab/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)**
+   - *Architecture*: 177B total parameter MoE, Quantization-Aware Distilled (QAD).
+   - *Quantization*: NVFP4 routed experts + MXFP8 shared experts, BF16 attention & embeddings.
+   - *Performance*: Achieves **~62–65 tokens/sec decode** on 4x RTX 5060 Ti with interactive latency.
+
+2. **[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)** (Base: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next))
+   - *Architecture*: ModelOpt-quantized candidate release of Qwen3.8 Flash Next.
+   - *Quantization*: W4A4 NVFP4 routed experts with standard dense layers.
+
+---
+
+### Production Launch Setup (4x RTX 5060 Ti TP=4)
+
+Below is our production launch configuration used on Lenovo ThinkStation P920 (4x RTX 5060 Ti 16GB):
+
+```bash
+# 1. Convert checkpoint to FTW format (pre-seeds expert banks for instant load)
+ft checkpoint convert \
+  --model local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
+  --output /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW
+
+# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 15,000 MoE cache slots)
+numactl --interleave=all ft serve \
+  --model /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW \
+  --tp-size 4 \
+  --gpu 0,1,2,3 \
+  --moe-strategy offload \
+  --quant-backend moe.nvfp4=triton \
+  --ple-backend pinned \
+  --expert-load serial \
+  --embed-device cpu \
+  --decode-interleave-every 4 \
+  --moe-cache-size 15000 \
+  --memory-ratio 0.95 \
+  --moe-prefill-hit-d2d \
+  --kv-cache-dtype fp8 \
+  --num-tokens 200000 \
+  --max-seq-len-override 200000 \
+  --kv-reserve-tokens 200000 \
+  --max-running-requests 2 \
+  --cuda-graph-max-bs 2 \
+  --max-extend-length 4096 \
+  --mamba-host-slots 32 \
+  --served-model-name Qwen3.8-Flash-Next-NVFP4-QAD \
+  --text-model-only \
+  --step-timeout 120 \
+  --distributed-timeout 2592000 \
+  --host 0.0.0.0 --port 8000
+```
+
+---
+
 ## About
 
 FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  

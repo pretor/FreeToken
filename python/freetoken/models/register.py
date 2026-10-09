@@ -84,6 +84,10 @@ _MINIMAX_M3_PACKED = _DENSE_PACKED + (
 ) + _EXPERTS_W123_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# DeepSeek-V4's vision dims sit at the top level of the checkpoint config, next to the
+# language model's rather than under a section of their own.
+_DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
+_DSV4_ENCODERS = (EncoderSpec("vision", "vision_n_layers", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "LlamaForCausalLM": ModelSpec(
@@ -153,8 +157,13 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         # the checkpoint has no ``model.`` root
         checkpoint_roots=(("model.layers", "layers"), ("model.head", "head")),
         packed_modules_mapping=_EXPERTS_W123_PACKED,
-        # the head, the KV compressors and the indexer's scorer ship bf16; the fp8 config has no modules_to_not_convert
-        unquantized_modules=("head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj"),
+        # the head, the KV compressors, the indexer's scorer and the vision tower + aligner ship bf16;
+        # the fp8 config has no modules_to_not_convert (patterns match checkpoint names, like V4.1)
+        unquantized_modules=(
+            "head", "*.compressor.wkv", "*.compressor.wgate", "*.indexer.weights_proj", "vision.*", "aligner.*",
+        ),
+        mm_processor=_DSV4_PROCESSOR,
+        encoders=_DSV4_ENCODERS,
     ),
     # DeepSeek-V4.1-Flash (model_type deepseek_v41): multimodal wrapper config (text tower in
     # text_config). The checkpoint has no ``model.`` root; the compressors, the indexer's key projection /

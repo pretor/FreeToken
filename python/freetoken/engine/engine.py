@@ -17,7 +17,7 @@ from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
-from freetoken.mm.config import ENCODER_SECTIONS
+from freetoken.mm.config import ENCODER_SECTIONS, check_cpu_encoder_support
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
@@ -426,6 +426,8 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
+        if config.active_encoders and config.mm.encoder_out_of_process:
+            check_cpu_encoder_support(config.model_spec.mm_processor)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
@@ -437,8 +439,9 @@ class Engine:
                     f"{type(self.model).__name__} has encoders registered but lacks the SupportsMultimodal hooks; "
                     "run with --text-model-only"
                 )
-            # before the residency snapshot, so streamed blocks are not charged as resident weights
-            self.model.place_encoder_weights(config.mm.encoder_weights)
+            if not config.mm.encoder_out_of_process:
+                # before the residency snapshot, so streamed blocks are not charged as resident weights
+                self.model.place_encoder_weights(config.mm.encoder_weights)
         # before the residency snapshot, so the freed table goes to the KV pool
         embed_host_bytes = self._move_embeddings_to_host() if config.embed_device == "cpu" else 0
         post_weights_free = self._sync_get_memory()[0]
@@ -470,11 +473,15 @@ class Engine:
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
             self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            placement = (
+                "the CPU encoder process" if config.mm.encoder_out_of_process else config.mm.encoder_weights
+            )
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
-                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+                f"{[e.kind for e in config.active_encoders]} on {placement}, serving {sorted(config.served_modalities)}"
             )
-            self._warmup_encoders()
+            if not config.mm.encoder_out_of_process:
+                self._warmup_encoders()
         elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
             logger.info_rank0(
                 "Multimodal disabled: --text-model-only"
@@ -660,7 +667,7 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not getattr(config.model_config, "is_moe", False),
-                include_vision=bool(config.active_encoders),
+                include_vision=bool(config.active_encoders) and not config.mm.encoder_out_of_process,
             ),
             device=self.device,
         )
@@ -698,7 +705,10 @@ class Engine:
         for item in jobs:
             if not cache.has(item.hash):
                 if item.precomputed_embeddings is not None:
-                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                    emb = item.precomputed_embeddings
+                    # the CPU encoder's rows are already in host memory; only device storage needs the upload
+                    if cache.storage == "cuda":
+                        emb = emb.to(self.device, non_blocking=True)
                 else:
                     emb = self.model.encode(item)
                 cache.put(item.hash, emb)

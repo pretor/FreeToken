@@ -37,11 +37,6 @@ class VisionLayerNorm(BaseOP):
         return F.layer_norm(x, (self._size,), self.weight, self.bias, self._eps)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
-
-
 _warned_rope_fallback = False
 
 
@@ -51,25 +46,31 @@ def _apply_vision_rope(
     """In-place 2D rope through the NeoX text kernel: the [c,c]/[s,s] layout is the half-rotation layout and positions index per-token cache rows."""
     global _warned_rope_fallback
     S = q.shape[0]
-    try:
-        from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
+    # the triton kernel takes device pointers; the CPU encoder (--mm-encoder-weights cpu) always runs eager
+    if q.is_cuda:
+        try:
+            from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
 
-        apply_rope_with_cos_sin_cache_inplace(
-            positions, q.view(S, -1), k.view(S, -1), head_dim, cache, is_neox=True
-        )
-        return
-    except ImportError:
-        # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
-        if not _warned_rope_fallback:
-            _warned_rope_fallback = True
-            from freetoken.utils import init_logger
+            apply_rope_with_cos_sin_cache_inplace(
+                positions, q.view(S, -1), k.view(S, -1), head_dim, cache, is_neox=True
+            )
+            return
+        except ImportError:
+            # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
+            if not _warned_rope_fallback:
+                _warned_rope_fallback = True
+                from freetoken.utils import init_logger
 
-            init_logger(__name__).warning("vision rope triton kernel unavailable; using eager")
+                init_logger(__name__).warning("vision rope triton kernel unavailable; using eager")
     half = cache.shape[1] // 2
-    cos = torch.cat((cache[:, :half], cache[:, :half]), dim=-1).unsqueeze(-2)
-    sin = torch.cat((cache[:, half:], cache[:, half:]), dim=-1).unsqueeze(-2)
-    q.copy_((q.float() * cos + _rotate_half(q.float()) * sin).to(q.dtype))
-    k.copy_((k.float() * cos + _rotate_half(k.float()) * sin).to(k.dtype))
+    # [x1, x2] -> [x1*c - x2*s, x2*c + x1*s] from views of the table: no per-layer cos/sin or rotated copies
+    cos, sin = cache[:, None, :half], cache[:, None, half:]
+    for x in (q, k):
+        x1, x2 = x[..., :half].float(), x[..., half:].float()
+        lo = torch.addcmul(x1 * cos, x2, sin, value=-1)
+        hi = torch.addcmul(x2 * cos, x1, sin)
+        x[..., :half].copy_(lo)
+        x[..., half:].copy_(hi)
 
 
 class VisionAttention(BaseOP):
@@ -219,7 +220,14 @@ class Qwen3VLVisionModel(BaseOP):
     Columns past out_hidden are the DeepStack side features in deepstack_visual_indexes order.
     """
 
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+    def __init__(
+        self,
+        vc: VisionConfig,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "visual",
+        rope_dtype: torch.dtype | None = None,
+    ):
         self.patch_embed = VisionConv3dPatchEmbed(vc)
         self.pos_embed = _EmbeddingParams(vc.num_position_embeddings, vc.hidden_size)
         self.blocks = OPList(
@@ -238,6 +246,8 @@ class Qwen3VLVisionModel(BaseOP):
         self._num_grid_per_side = int(vc.num_position_embeddings**0.5)
         self._inv_dim = (vc.hidden_size // vc.num_heads) // 2
         self._inv_freq: torch.Tensor | None = None
+        # None follows the weights; the FP32 CPU tower passes bf16 to keep the GPU path's rope rounding
+        self._rope_dtype = rope_dtype
         self._streamer: BlockWeightStreamer | None = None
 
     def place_weights(self, mode: str) -> None:
@@ -284,7 +294,7 @@ class Qwen3VLVisionModel(BaseOP):
             inv_dim = self._inv_dim
             self._inv_freq = (
                 1.0 / (10000.0 ** (torch.arange(0, inv_dim, 2, dtype=torch.float32, device=device) / inv_dim))
-            ).to(self.pos_embed.weight.dtype)
+            ).to(self._rope_dtype or self.pos_embed.weight.dtype)
         pos_ids = get_vision_position_ids(grid, self._vc.spatial_merge_size)
         # long * bf16 -> bf16 freqs on purpose; fp32 freqs would round differently
         freqs = (pos_ids.unsqueeze(-1) * self._inv_freq).flatten(1)  # [S, head_dim/2]

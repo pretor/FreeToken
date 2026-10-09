@@ -60,7 +60,7 @@ class Qwen3VLForConditionalGeneration(QwenVLVisionMixin, Qwen3ForCausalLM):
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        if config.is_multimodal:
+        if config.builds_vision_tower:
             self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
 
 
@@ -69,7 +69,7 @@ class Qwen3VLMoeForConditionalGeneration(QwenVLVisionMixin, Qwen3MoeForCausalLM)
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
-        if config.is_multimodal:
+        if config.builds_vision_tower:
             self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
 
 

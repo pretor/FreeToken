@@ -25,6 +25,10 @@ class EncoderCache:
         self._storage = storage
         self._entries: Dict[int, _Entry] = {}
 
+    @property
+    def storage(self) -> str:
+        return self._storage
+
     def register(self, item_hash: int, uid: int, rows: int) -> None:
         """Claim rows of the image for uid before any of its chunks run; a repeated image adds up."""
         if rows <= 0:

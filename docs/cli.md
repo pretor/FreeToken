@@ -146,12 +146,49 @@ so a client can gate its attachment controls without reading the checkpoint conf
 | --- | --- | --- |
 | `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
 | `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
-| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way |
+| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way. `cpu` (Qwen VL families) keeps the whole tower in host RAM and runs it in FP32 in a separate CPU process before a request reaches the GPUs: no VRAM at all, see [CPU vision encoder](#cpu-vision-encoder) |
+| `--mm-encoder-threads` | one NUMA node's cores | `--mm-encoder-weights cpu`: torch threads of the encoder process. Defaults to the CPUs of `--mm-encoder-cpus`, else the physical cores of one NUMA node |
+| `--mm-encoder-cpus` | not pinned | `--mm-encoder-weights cpu`: CPU list the encoder process is pinned to, as `taskset` spells it (`22-43`, `0-3,8`) |
+| `--mm-encoder-cache-mb` | 256 | `--mm-encoder-weights cpu`: host RAM for recently encoded images, keyed by content, so an image a chat client resends on the next turn is not encoded again. `0` disables it |
 | `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units by its processor. A family with fixed budgets honors the maximum only and refuses one below its smallest budget at start-up |
 | `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for knobs the token budget does not cover; applied after the budget, so an explicit key wins |
 | `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
 | `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
 | `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |
+
+#### CPU vision encoder
+
+`--mm-encoder-weights cpu` moves the Qwen VL vision tower out of the engine. A separate process
+(`freetoken-vision-cpu`, started with no CUDA device visible) holds the tower once in host RAM in
+FP32. The tokenizer sends it every request that carries images. It replaces each image's pixels with
+the tower's output rows and passes the request on to the scheduler. The TP ranks build no tower and
+load none of its weights, so serving images costs no VRAM. Running requests keep decoding while an
+image encodes, because the encode happens before the request reaches the GPUs. Text-only requests
+never pass through the encoder.
+
+- FP32, because CPUs without AVX512-BF16 or AMX run BF16 matmuls slower than FP32, and FP32 stays
+  closest to the reference.
+- The process runs at nice 10 and sets its own torch thread count, so an inherited small
+  `OMP_NUM_THREADS` does not throttle it.
+- Images are capped at 1024 tokens (about 1 MP) unless `--image-max-tokens` says otherwise. The
+  Qwen VL checkpoints allow 16k tokens per image, which is minutes of CPU time.
+- Recently encoded images are kept by content (`--mm-encoder-cache-mb`), so a chat client that
+  resends the same picture every turn pays for it once.
+
+Measured on 2x Xeon Gold 6152 (Skylake-SP, AVX-512) with Qwen3.8-Flash-Next, 22 threads, not pinned
+(`benchmarks/bench_cpu_vision.py`):
+
+| Image tokens | Encode time | Peak RSS |
+| --- | --- | --- |
+| 256 | 1.1 s | 2.5 GB |
+| 484 | 2.0 s | 2.7 GB |
+| 1024 | 5.4 s | 2.9 GB |
+| 2025 | 16.6 s | 3.0 GB |
+
+44 threads (both sockets) was no faster than 22, and binding the process to one NUMA node was
+slower than leaving it unpinned. Encoding 1024-token images back to back next to a TP=4 server cost
+its decode about 1-3% and its time to first token about 0.2 s. Against `--text-model-only` on the
+same TP=4 server, VRAM use grew by about 20 MiB per GPU and text decode speed did not change.
 
 ## ft shell
 

@@ -124,6 +124,7 @@ class Qwen3_5ForConditionalGeneration(QwenVLVisionMixin, Qwen3_5ForCausalLM):
         super().__init__(config)
         if config.is_multimodal:
             assert not config.vision_config.deepstack_visual_indexes, "Qwen3.5 consumes no DeepStack features"
+        if config.builds_vision_tower:
             self.visual = Qwen3VLVisionModel(config.vision_config, quant_config=config.quant, prefix="visual")
 
 

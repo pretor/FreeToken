@@ -578,6 +578,21 @@ class Scheduler(SchedulerIOMixin):
                     ]
                 )
                 return
+            if (
+                msg.mm_items
+                and self.engine.config.mm.encoder_out_of_process
+                and any(item.precomputed_embeddings is None for item in msg.mm_items)
+            ):
+                # the TP ranks hold no tower in this mode; refusing here keeps every rank's forward alive
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="image input reached the engine without its CPU encoding",
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:

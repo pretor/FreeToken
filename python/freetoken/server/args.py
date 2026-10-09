@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 from typing import List, Tuple
 
 import torch
-from freetoken.mm.config import ENCODER_KINDS, MultimodalConfig
+from freetoken.mm.config import (
+    CPU_ENCODER_DEFAULT_MAX_TOKENS,
+    ENCODER_KINDS,
+    MultimodalConfig,
+    check_cpu_encoder_support,
+    parse_cpu_list,
+)
 from freetoken.distributed import DistributedInfo
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
@@ -91,6 +97,11 @@ class ServerArgs(SchedulerConfig):
         return result
 
     @property
+    def zmq_encoder_addr(self) -> str:
+        """The CPU vision encoder process (--mm-encoder-weights cpu): tokenizers push image requests here."""
+        return "ipc:///tmp/freetoken_5" + self._unique_suffix
+
+    @property
     def tokenizer_create_addr(self) -> bool:
         return self.share_tokenizer
 
@@ -115,6 +126,23 @@ def _json_object(text: str) -> dict:
     if not isinstance(value, dict):
         raise argparse.ArgumentTypeError("expected a JSON object")
     return value
+
+
+def _cpu_list(text: str) -> tuple[int, ...]:
+    try:
+        return parse_cpu_list(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a CPU list like 22-43 or 0-3,8, got {text!r}") from None
+
+
+def _non_negative_int(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return n
 
 
 def parse_args(
@@ -567,10 +595,35 @@ def parse_args(
 
     parser.add_argument(
         "--mm-encoder-weights",
-        choices=["gpu", "host"],
+        choices=["gpu", "host", "cpu"],
         default=MultimodalConfig.encoder_weights,
         help="Encoder tower block weights: pinned host banks streamed two blocks at a time behind the "
-        "compute (default, about 60 MiB of VRAM instead of the whole tower), or resident on the GPU.",
+        "compute (default, about 60 MiB of VRAM instead of the whole tower), resident on the GPU, or "
+        "'cpu': the whole tower in host RAM, run in FP32 by a separate CPU process before a request "
+        "reaches the GPUs (no VRAM at all; Qwen VL families; caps images at "
+        f"{CPU_ENCODER_DEFAULT_MAX_TOKENS} tokens unless --image-max-tokens is given).",
+    )
+    parser.add_argument(
+        "--mm-encoder-threads",
+        type=_positive_int,
+        default=MultimodalConfig.encoder_threads,
+        help="--mm-encoder-weights cpu: torch threads of the encoder process. Default: the CPUs of "
+        "--mm-encoder-cpus, else the physical cores of one NUMA node.",
+    )
+    parser.add_argument(
+        "--mm-encoder-cpus",
+        type=_cpu_list,
+        default=MultimodalConfig.encoder_cpus,
+        metavar="LIST",
+        help="--mm-encoder-weights cpu: CPUs the encoder process is pinned to, e.g. 22-43 or 0-3,8. "
+        "Default: not pinned.",
+    )
+    parser.add_argument(
+        "--mm-encoder-cache-mb",
+        type=_non_negative_int,
+        default=MultimodalConfig.encoder_cache_mb,
+        help="--mm-encoder-weights cpu: host RAM for recently encoded images, so an image resent on the "
+        "next turn is not encoded again. 0 disables it.",
     )
 
     parser.add_argument(
@@ -1009,17 +1062,30 @@ def parse_args(
     disabled = set(ENCODER_KINDS) if kwargs.pop("text_model_only") else set()
     disabled.update(kwargs.pop("mm_disable"))
     image_min_tokens, image_max_tokens = kwargs.pop("image_min_tokens"), kwargs.pop("image_max_tokens")
+    encoder_weights = kwargs.pop("mm_encoder_weights")
+    if encoder_weights == "cpu" and image_max_tokens is None:
+        # the checkpoint defaults allow 16k tokens per image: minutes of CPU time each
+        image_max_tokens = max(CPU_ENCODER_DEFAULT_MAX_TOKENS, image_min_tokens or 0)
+        logger.info(f"--mm-encoder-weights cpu: images capped at {image_max_tokens} tokens (--image-max-tokens)")
     if image_min_tokens is not None and image_max_tokens is not None and image_min_tokens > image_max_tokens:
         parser.error(f"--image-min-tokens {image_min_tokens} exceeds --image-max-tokens {image_max_tokens}")
     kwargs["mm"] = MultimodalConfig(
         disabled_encoders=frozenset(disabled),
         embed_cache_device=kwargs.pop("mm_embed_cache_device"),
-        encoder_weights=kwargs.pop("mm_encoder_weights"),
+        encoder_weights=encoder_weights,
         image_min_tokens=image_min_tokens,
         image_max_tokens=image_max_tokens,
         processor_kwargs=kwargs.pop("mm_processor_kwargs") or {},
+        encoder_threads=kwargs.pop("mm_encoder_threads"),
+        encoder_cpus=kwargs.pop("mm_encoder_cpus"),
+        encoder_cache_mb=kwargs.pop("mm_encoder_cache_mb"),
     )
     kwargs["hf_overrides"] = kwargs["hf_overrides"] or {}
     result = ServerArgs(**kwargs)
+    if result.mm.encoder_out_of_process and result.active_encoders:
+        try:
+            check_cpu_encoder_support(result.model_spec.mm_processor)
+        except ValueError as exc:
+            parser.error(str(exc))
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

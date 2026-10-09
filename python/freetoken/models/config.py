@@ -323,6 +323,9 @@ class ModelConfig:
     output_multiplier: float | None = None
     vision_config: Any | None = None
     image_token_id: int | None = None
+    # False when the tower runs outside the TP ranks (--mm-encoder-weights cpu): vision_config still
+    # drives M-RoPE and the image processor, but the model neither builds nor loads the tower
+    encoders_in_engine: bool = True
     attention_groups: Tuple[AttentionGroupConfig, ...] = ()
     has_attn_bias: bool = False
     has_router_bias: bool = False
@@ -376,6 +379,10 @@ class ModelConfig:
     @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
+
+    @property
+    def builds_vision_tower(self) -> bool:
+        return self.is_multimodal and self.encoders_in_engine
 
     @property
     def model_is_mrope(self) -> bool:

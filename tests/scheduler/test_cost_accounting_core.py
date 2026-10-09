@@ -20,6 +20,7 @@ from freetoken.message import (
     BatchTokenizerMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    MMItem,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
@@ -149,6 +150,33 @@ def test_scheduler_rejection_emits_error_but_no_admission():
     assert added == []
     assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg)
     assert not any(isinstance(msg, PromptAdmittedMsg) for msg in sent)
+
+
+def test_cpu_encoder_mode_admits_only_images_that_arrive_encoded():
+    # --mm-encoder-weights cpu: the TP ranks hold no tower, so pixels reaching them must end in an error, not a crash
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(
+        max_seq_len=64, encoder_cache=object(),
+        config=SimpleNamespace(mm=SimpleNamespace(encoder_out_of_process=True)),
+    )
+    added = []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=added.append)
+    sent = []
+    scheduler.send_result = sent.extend
+
+    def request(uid, **item_data):
+        item = MMItem(modality="image", hash=uid, pad_value=uid, offsets=[[0, 4]], **item_data)
+        return UserMsg(
+            uid=uid, input_ids=torch.arange(8, dtype=torch.int32),
+            sampling_params=SamplingParams(max_tokens=1), mm_items=[item],
+        )
+
+    Scheduler._process_one_msg(scheduler, request(9, feature=torch.zeros(1)))
+    assert added == []
+    assert len(sent) == 1 and isinstance(sent[0], ErrorReplyMsg) and "CPU encoding" in sent[0].error
+
+    Scheduler._process_one_msg(scheduler, request(10, precomputed_embeddings=torch.zeros(4, 2)))
+    assert [msg.uid for msg in added] == [10] and len(sent) == 1
 
 
 def test_scheduler_always_emits_terminal_abort_ack_for_unknown_uid():

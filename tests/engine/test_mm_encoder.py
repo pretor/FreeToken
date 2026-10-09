@@ -90,6 +90,23 @@ def test_precomputed_embeddings_bypass_the_encoder():
     assert not cache.has(4)
 
 
+def test_host_precomputed_rows_go_straight_into_host_storage():
+    # the CPU encoder's rows are already in host memory: an upload first would only be copied back
+    cache = EncoderCache(storage="cpu")
+    stored = []
+    put = cache.put
+    cache.put = lambda item_hash, emb: (stored.append(emb), put(item_hash, emb))
+    eng = _engine(cache)
+    eng.device = torch.device("meta")  # any device copy would hand the host cache a meta tensor
+    emb = torch.full((4, H), 2.0)
+    cache.register(5, 1, 4)
+    batch = _batch([_item(h=5, n_tokens=4, precomputed=emb)], [(1, 5, 0, 4, 4, 0)])
+    Engine._run_mm_encoder(eng, batch)
+    assert stored[0] is emb
+    assert eng.model.calls == 0
+    assert batch.mm_embeds.shape == (4, H)
+
+
 def test_job_without_gather_row_fails_loudly():
     eng = _engine(EncoderCache(storage="cpu"))
     with pytest.raises(AssertionError, match="encoder jobs without gather rows"):

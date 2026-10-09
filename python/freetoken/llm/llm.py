@@ -43,6 +43,15 @@ class LLM(Scheduler):
         from freetoken.mm.processor import get_mm_processor
 
         self._mm_processor = get_mm_processor(model_path, config.mm)
+        self._cpu_encoder = None
+
+    def _encode_on_cpu(self, msg: UserMsg) -> None:
+        """--mm-encoder-weights cpu: no tokenizer process runs here, so this process holds the CPU tower, loaded on the first image."""
+        if self._cpu_encoder is None:
+            from freetoken.mm.cpu_encoder import CpuVisionEncoder
+
+            self._cpu_encoder = CpuVisionEncoder.from_checkpoint(self.config.model_path, self.config.mm, self.config.dtype)
+        self._cpu_encoder.encode_msg(msg)
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):
@@ -73,6 +82,8 @@ class LLM(Scheduler):
                     mrope_positions=r.mrope_positions,
                     mrope_delta=r.mrope_delta,
                 )
+                if self.config.mm.encoder_out_of_process:
+                    self._encode_on_cpu(msg)
             sum_input_len += len(input_ids)
             uid, added = self.counter + added, added + 1
             msg.uid = uid

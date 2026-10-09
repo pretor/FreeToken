@@ -22,12 +22,26 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
 2. **Vision Tower TP Sharding (Multi-Modal Acceleration)**:
    - Shards vision encoder weights across all TP ranks (`_shard_vision_tensor`), dividing ViT memory to only **~214 MB per GPU** instead of duplicating 856 MB on every card or crashing under TP > 1.
 
-3. **Pre-Merged Cutting-Edge Upstream PRs**:
+3. **CPU Vision Encoder: the Vision Tower in RAM, Zero VRAM (`--mm-encoder-weights cpu`)**:
+   - **What**: image input on Qwen3.8-Flash-Next without spending VRAM. The vision tower (27-block ViT, ~449M params) lives once in host RAM in FP32 and runs in its own CPU process (`freetoken-vision-cpu`, no CUDA device visible), modelled on [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4)'s `strata-vision` sidecar.
+   - **How it works**: the tokenizer sends only the requests that carry images to the encoder process. It replaces each image's pixels with the tower's output rows and passes the request on to the scheduler. The 4 TP ranks build and load no tower, so the KV cache and the expert cache keep their full size, and running requests keep decoding while an image encodes. Text-only requests never pass through it.
+   - **Why FP32 on the CPU**: these Xeons have no BF16 or AMX units. BF16 was ~2x slower than FP32 and ~11-12% off it at 1024 tokens, the same drift the BF16 GPU tower shows against FP32.
+   - **Knobs**:
+     - Images are capped at 1024 tokens unless `--image-max-tokens` is given.
+     - `--mm-encoder-cache-mb` (default 256) keeps recently encoded images, so an image a chat client resends every turn is encoded once.
+     - `--mm-encoder-threads` / `--mm-encoder-cpus` control placement. By default it uses one NUMA node's physical cores, not pinned; that measured fastest.
+   - **Measured on this ThinkStation (2x Xeon Gold 6152, 22 threads)**:
+     - Encode time per image: 1.1 s at 256 tokens, 2.0 s at 484, 5.4 s at 1024, 16.6 s at 2025.
+     - Against `--text-model-only`: VRAM grows by ~20 MiB per GPU, the KV cache (200k tokens) and expert cache are unchanged, text decode is unchanged (~62-64 tok/s), and the encoder process takes ~2.4 GB RSS.
+     - End to end: the model reads image content correctly (colours, text in the picture), a resent image comes from the cache, a corrupt image gets a clean 400, and an abort mid-encode is handled.
+   - Details: [CPU vision encoder](docs/cli.md#cpu-vision-encoder); benchmark: `benchmarks/bench_cpu_vision.py`.
+
+4. **Pre-Merged Cutting-Edge Upstream PRs**:
    - **[PR #635](https://github.com/FlashML-org/FreeToken/pull/635)**: `perf(moe): avoid intra-op fanout while filling NVFP4 host banks` — eliminates intra-op fanout latency when populating host-side NVFP4 expert banks.
    - **[PR #636](https://github.com/FlashML-org/FreeToken/pull/636)**: `feat(quant): opt-in fp8-block QAT for the lm_head` — enables FP8-block quantized LM heads to conserve GPU memory.
    - **[PR #639](https://github.com/FlashML-org/FreeToken/pull/639)**: `feat(server): add --api-key authentication` — adds `--api-key` and `$FREETOKEN_API_KEY` bearer authentication to protect the server endpoint.
 
-4. **Production Stability & 200k Context Resilience**:
+5. **Production Stability & 200k Context Resilience**:
    - Custom timeout flags (`--step-timeout 120`, `--distributed-timeout 2592000`) that prevent NCCL heartbeat and rendezvous timeouts during long idle stretches or heavy prefill batches.
    - Production-verified **FP8 KV-Cache** across up to **200,000 tokens** (~1.31 GiB VRAM per GPU for 200k tokens).
 
@@ -41,6 +55,7 @@ These models have been tested and run at full speed on this fork:
    - *Architecture*: 177B total parameter MoE, Quantization-Aware Distilled (QAD).
    - *Quantization*: NVFP4 routed experts + MXFP8 shared experts, BF16 attention & embeddings.
    - *Performance*: Achieves **~62–65 tokens/sec decode** on 4x RTX 5060 Ti with interactive latency.
+   - *Vision*: image input served by the CPU vision encoder (`--mm-encoder-weights cpu`), with no VRAM spent on the vision tower.
 
 2. **[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)** (Base: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next))
    - *Architecture*: ModelOpt-quantized candidate release of Qwen3.8 Flash Next.
@@ -58,7 +73,7 @@ ft checkpoint convert \
   --model local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
   --output /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW
 
-# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 15,000 MoE cache slots)
+# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 15,000 MoE cache slots, image input on the CPU)
 numactl --interleave=all ft serve \
   --model /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW \
   --tp-size 4 \
@@ -81,11 +96,22 @@ numactl --interleave=all ft serve \
   --max-extend-length 4096 \
   --mamba-host-slots 32 \
   --served-model-name Qwen3.8-Flash-Next-NVFP4-QAD \
-  --text-model-only \
+  --mm-encoder-weights cpu \
   --step-timeout 120 \
   --distributed-timeout 2592000 \
   --host 0.0.0.0 --port 8000
+
+# 3. Send an image (OpenAI API; an http(s) URL or a base64 data: URL)
+curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "Qwen3.8-Flash-Next-NVFP4-QAD",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "https://example.com/picture.png"}},
+    {"type": "text", "text": "What is in this picture?"}]}]}'
 ```
+
+`--mm-encoder-weights cpu` serves images with the vision tower on the CPU (see item 3 above); images are
+capped at 1024 tokens unless `--image-max-tokens` is given. For text-only serving, use `--text-model-only`
+instead, which also saves the encoder process's ~2.4 GB of RAM.
 
 ---
 

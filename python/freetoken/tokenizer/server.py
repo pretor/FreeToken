@@ -123,6 +123,20 @@ def _tokenize_requests(
     return backend, errors
 
 
+def _route_user_msgs(send_backend: Any, send_encoder: Any, msgs: List[UserMsg]) -> None:
+    """With the CPU vision encoder, requests carrying images go through it and it forwards them to the
+    scheduler once encoded; every other request goes straight to the scheduler."""
+    routes = [(send_backend, msgs)]
+    if send_encoder is not None:
+        routes = [
+            (send_encoder, [m for m in msgs if m.mm_items]),
+            (send_backend, [m for m in msgs if not m.mm_items]),
+        ]
+    for queue, group in routes:
+        if group:
+            queue.put(group[0] if len(group) == 1 else BatchBackendMsg(data=group))
+
+
 @torch.inference_mode()
 def tokenize_worker(
     *,
@@ -136,8 +150,12 @@ def tokenize_worker(
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
     mm: MultimodalConfig | None = None,
+    encoder_addr: str | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
+    send_encoder = (
+        ZmqPushQueue(encoder_addr, create=False, encoder=BaseBackendMsg.encoder) if encoder_addr else None
+    )
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
@@ -253,7 +271,7 @@ def tokenize_worker(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if backend:
-                    send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
+                    _route_user_msgs(send_backend, send_encoder, backend)
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]

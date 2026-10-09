@@ -140,3 +140,51 @@ def test_image_token_budget_flags_land_in_the_multimodal_config():
         assert parse_args(["--model", "/models/anon"])[0].mm.processor_kwargs == {}
         with pytest.raises(SystemExit):  # argparse reports the bad pair and exits
             parse_args(["--model", "/models/anon", "--image-min-tokens", "2048", "--image-max-tokens", "1024"])
+
+
+def _hf_with_vision(arch):
+    return SimpleNamespace(
+        architectures=[arch], vision_config=SimpleNamespace(),
+        to_dict=lambda: {"architectures": [arch], "torch_dtype": "bfloat16"},
+    )
+
+
+def test_cpu_encoder_flags_land_in_the_multimodal_config():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    hf = _hf_with_vision("Qwen4ExpForConditionalGeneration")
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf), patch(
+        "freetoken.engine.config.cached_load_hf_config", lambda _path, _overrides=None: hf
+    ):
+        cpu = ["--model", "/models/anon", "--mm-encoder-weights", "cpu"]
+        mm = parse_args(cpu)[0].mm
+        assert mm.encoder_out_of_process and mm.image_max_tokens == 1024  # the CPU default cap
+        assert (mm.encoder_threads, mm.encoder_cpus, mm.encoder_cache_mb) == (None, None, 256)
+        mm = parse_args(cpu + [
+            "--image-max-tokens", "2048", "--mm-encoder-threads", "8", "--mm-encoder-cpus", "22-25",
+            "--mm-encoder-cache-mb", "0",
+        ])[0].mm
+        assert (mm.image_max_tokens, mm.encoder_threads, mm.encoder_cpus, mm.encoder_cache_mb) == (
+            2048, 8, (22, 23, 24, 25), 0,
+        )
+        # the default cap never undercuts an explicit floor; the other placements keep the checkpoint limits
+        assert parse_args(cpu + ["--image-min-tokens", "1500"])[0].mm.image_max_tokens == 1500
+        assert parse_args(["--model", "/models/anon"])[0].mm.image_max_tokens is None
+        with pytest.raises(SystemExit):
+            parse_args(cpu + ["--mm-encoder-cpus", "3-1"])
+
+
+def test_cpu_encoder_refuses_a_family_without_the_qwen_vl_tower():
+    from unittest.mock import patch
+
+    from freetoken.server.args import parse_args
+
+    hf = _hf_with_vision("Gemma4ForConditionalGeneration")
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf), patch(
+        "freetoken.engine.config.cached_load_hf_config", lambda _path, _overrides=None: hf
+    ):
+        with pytest.raises(SystemExit):
+            parse_args(["--model", "/models/anon", "--mm-encoder-weights", "cpu"])
+        assert parse_args(["--model", "/models/anon", "--mm-encoder-weights", "host"])[0].mm.encoder_weights == "host"

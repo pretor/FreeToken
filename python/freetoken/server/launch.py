@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import multiprocessing as mp
 import os
@@ -53,6 +54,39 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     from freetoken.tokenizer import tokenize_worker
 
     tokenize_worker(**kwargs)
+
+
+def _run_vision_encoder(detach: bool, ack_queue: mp.Queue, model_path: str, mm, dtype, **addrs) -> None:
+    """The --mm-encoder-weights cpu process; started with no CUDA device visible (see _cuda_hidden)."""
+    if detach:
+        _detach_process_group()
+    from freetoken.mm.cpu_encoder import CpuVisionEncoder, configure_encoder_process, serve_vision_encoder
+
+    try:
+        threads = configure_encoder_process(mm)
+        encoder = CpuVisionEncoder.from_checkpoint(model_path, mm, dtype)
+    except Exception as exc:  # noqa: BLE001 -- surface the reason, then let it propagate
+        _report_startup_error(ack_queue, exc)
+        raise
+    init_logger(__name__, "vision_cpu").info(
+        f"CPU vision encoder ready: {threads} threads, image cache {mm.encoder_cache_mb} MiB"
+    )
+    serve_vision_encoder(encoder, ack_queue=ack_queue, **addrs)
+
+
+@contextlib.contextmanager
+def _cuda_hidden():
+    """A spawned child copies this environment at start: with no device visible the CPU encoder can never
+    open a CUDA context, which would take hundreds of MiB from GPU 0's pools."""
+    old = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
@@ -173,6 +207,28 @@ def launch_server(
             p.start()
             processes.append(p)
 
+        encoder_addr = None
+        if server_args.mm.encoder_out_of_process and "image" in server_args.served_modalities:
+            encoder_addr = server_args.zmq_encoder_addr
+            p = mp.Process(
+                target=_run_vision_encoder,
+                kwargs={
+                    "detach": detach,
+                    "ack_queue": ack_queue,
+                    "model_path": server_args.model_path,
+                    "mm": server_args.mm,
+                    "dtype": server_args.dtype,
+                    "addr": encoder_addr,
+                    "backend_addr": server_args.zmq_backend_addr,
+                    "frontend_addr": server_args.zmq_frontend_addr,
+                },
+                daemon=False,
+                name="freetoken-vision-cpu",
+            )
+            with _cuda_hidden():
+                p.start()
+            processes.append(p)
+
         num_tokenizers = server_args.num_tokenizer
         p = mp.Process(
             target=_run_tokenize_worker,
@@ -187,6 +243,7 @@ def launch_server(
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "ack_queue": ack_queue,
+                "encoder_addr": encoder_addr,
             },
             daemon=False,
             name="freetoken-detokenizer-0",
@@ -207,6 +264,7 @@ def launch_server(
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "ack_queue": ack_queue,
+                    "encoder_addr": encoder_addr,
                 },
                 daemon=False,
                 name=f"freetoken-tokenizer-{i}",
@@ -214,11 +272,11 @@ def launch_server(
             p.start()
             processes.append(p)
 
-        # Expected ready acks: 1 primary scheduler + num_tokenizers + 1 detokenizer.
+        # Expected ready acks: 1 primary scheduler + num_tokenizers + 1 detokenizer (+ the CPU vision encoder).
         return BackendHandle(
             ack_queue=ack_queue,
             processes=processes,
-            expected_acks=num_tokenizers + 2,
+            expected_acks=num_tokenizers + 2 + (encoder_addr is not None),
         )
 
     run_api_server(server_args, start_subprocess, run_shell=run_shell)

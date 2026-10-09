@@ -160,7 +160,7 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        return replace(model_config, quant=quant)
+        return replace(model_config, quant=quant, encoders_in_engine=not self.mm.encoder_out_of_process)
 
     @property
     def max_seq_len(self) -> int:

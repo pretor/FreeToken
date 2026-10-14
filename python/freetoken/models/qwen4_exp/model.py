@@ -188,7 +188,9 @@ class Qwen4ExpModel(BaseOP):
                     if layer.ple is not None:
                         commit_ngram_context(child.ple_meta, child.fla_metadata)
 
-            return self.hyper_connection_mixer.mix(hidden[-1])[0]
+            res = self.hyper_connection_mixer.mix(hidden[-1])[0]
+            hidden.clear()
+            return res
         finally:
             ctx._batch = full_batch
 
@@ -292,9 +294,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         try:
             hidden = self.model.forward_layer_major(chunk_batches)
             ctx._batch = chunk_batches[-1]
-            return self.lm_head.forward(hidden)
+            out = self.lm_head.forward(hidden)
+            del hidden
+            return out
         finally:
             ctx._batch = previous_batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 class Qwen4ExpForConditionalGeneration(QwenVLVisionMixin, Qwen4ExpForCausalLM):

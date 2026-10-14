@@ -32,24 +32,44 @@ def sample_impl(
     from freetoken.kernel.backend import is_flashinfer_installed
 
     if is_flashinfer_installed():
-        import flashinfer.sampling as sampling
-    else:
-        import freetoken.kernel.triton.sampling as sampling
+        try:
+            import flashinfer.sampling as sampling
 
-    probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+            probs = sampling.softmax(logits, temperatures, enable_pdl=is_sm90_supported())
+            if top_k is None and top_p is None:
+                return sampling.sampling_from_probs(probs)
+
+            if top_p is None:
+                assert top_k is not None
+                return sampling.top_k_sampling_from_probs(probs, top_k)
+
+            if top_k is None:
+                assert top_p is not None
+                return sampling.top_p_sampling_from_probs(probs, top_p)
+
+            assert top_k is not None and top_p is not None
+            return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+        except RuntimeError:
+            pass
+
+    import freetoken.kernel.triton.sampling as triton_sampling
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    probs = triton_sampling.softmax(logits, temperatures, enable_pdl=False)
     if top_k is None and top_p is None:
-        return sampling.sampling_from_probs(probs)
+        return triton_sampling.sampling_from_probs(probs)
 
     if top_p is None:
         assert top_k is not None
-        return sampling.top_k_sampling_from_probs(probs, top_k)
+        return triton_sampling.top_k_sampling_from_probs(probs, top_k)
 
     if top_k is None:
         assert top_p is not None
-        return sampling.top_p_sampling_from_probs(probs, top_p)
+        return triton_sampling.top_p_sampling_from_probs(probs, top_p)
 
     assert top_k is not None and top_p is not None
-    return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
+    return triton_sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
 
 @dataclass

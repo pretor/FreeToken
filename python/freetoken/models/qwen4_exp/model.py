@@ -176,7 +176,10 @@ class Qwen4ExpModel(BaseOP):
                     if layer.ple is not None:
                         child.ple_meta = build_ple_metadata(child, layer.ple.args, child.input_ids.device)
                     _copy_layer_major_track_state(ctx.linear_state_pool, layer, child)
-                    h, mlp_out, inject = layer.forward(hidden[index], child)
+                    inp = hidden[index]
+                    hidden[index] = None
+                    h, mlp_out, inject = layer.forward(inp, child)
+                    del inp
                     hidden[index] = layer.mlp_hyper_connection.combine(
                         h, layer.mlp_hyper_connection._epilogue(mlp_out), inject
                     )

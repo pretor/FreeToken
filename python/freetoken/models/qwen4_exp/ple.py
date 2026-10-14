@@ -722,11 +722,17 @@ class PLELayer(BaseOP):
         out = F.conv1d(
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation
         ).squeeze(0)
-        new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
-        states.index_copy_(
-            0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
-        )
-        return F.silu(out.index_select(1, out_index).transpose(0, 1))
+        if num_reqs == 1:
+            states[meta.state_slots[0]].copy_(history[:, -self.state_len:])
+            del history
+            return F.silu(out.t())
+        else:
+            new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
+            states.index_copy_(
+                0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
+            )
+            del history
+            return F.silu(out.index_select(1, out_index).t())
 
     def _prefill_indices(self, lens: List[int], device: torch.device):
         """Columns of the packed history: this forward's outputs, the state block, the next state block."""

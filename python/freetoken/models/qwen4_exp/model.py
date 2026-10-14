@@ -173,7 +173,7 @@ class Qwen4ExpModel(BaseOP):
                 ctx._batch = child
                 h = embed_input_ids(self.embed_tokens, child.input_ids, child).repeat(1, self.hc_count)
                 if is_cuda:
-                    hidden.append(h.to("cpu", pin_memory=True, non_blocking=True))
+                    hidden.append(h.to("cpu", non_blocking=True).pin_memory())
                     del h
                 else:
                     hidden.append(h)
@@ -194,7 +194,7 @@ class Qwen4ExpModel(BaseOP):
                     )
                     del h, mlp_out, inject
                     if is_cuda:
-                        hidden[index] = h_comb.to("cpu", pin_memory=True, non_blocking=True)
+                        hidden[index] = h_comb.to("cpu", non_blocking=True).pin_memory()
                         del h_comb
                     else:
                         hidden[index] = h_comb

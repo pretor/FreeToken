@@ -165,20 +165,11 @@ class Qwen4ExpModel(BaseOP):
 
         ctx = get_global_ctx()
         full_batch = ctx.batch
-        device = chunk_batches[0].input_ids.device
-        is_cuda = device.type == "cuda"
         hidden = []
         try:
             for child in chunk_batches:
                 ctx._batch = child
-                h = embed_input_ids(self.embed_tokens, child.input_ids, child).repeat(1, self.hc_count)
-                if is_cuda:
-                    hidden.append(h.to("cpu", non_blocking=True).pin_memory())
-                    del h
-                else:
-                    hidden.append(h)
-            if is_cuda:
-                torch.cuda.current_stream(device).synchronize()
+                hidden.append(embed_input_ids(self.embed_tokens, child.input_ids, child).repeat(1, self.hc_count))
 
             for layer in self.layers.op_list:
                 for index, child in enumerate(chunk_batches):
@@ -186,23 +177,18 @@ class Qwen4ExpModel(BaseOP):
                     if layer.ple is not None:
                         child.ple_meta = build_ple_metadata(child, layer.ple.args, child.input_ids.device)
                     _copy_layer_major_track_state(ctx.linear_state_pool, layer, child)
-                    inp = hidden[index].to(device, non_blocking=is_cuda) if is_cuda else hidden[index]
+                    inp = hidden[index]
+                    hidden[index] = None
                     h, mlp_out, inject = layer.forward(inp, child)
                     del inp
-                    h_comb = layer.mlp_hyper_connection.combine(
+                    hidden[index] = layer.mlp_hyper_connection.combine(
                         h, layer.mlp_hyper_connection._epilogue(mlp_out), inject
                     )
                     del h, mlp_out, inject
-                    if is_cuda:
-                        hidden[index] = h_comb.to("cpu", non_blocking=True).pin_memory()
-                        del h_comb
-                    else:
-                        hidden[index] = h_comb
                     if layer.ple is not None:
                         commit_ngram_context(child.ple_meta, child.fla_metadata)
 
-            last_h = hidden[-1].to(device, non_blocking=is_cuda) if is_cuda else hidden[-1]
-            return self.hyper_connection_mixer.mix(last_h)[0]
+            return self.hyper_connection_mixer.mix(hidden[-1])[0]
         finally:
             ctx._batch = full_batch
 

@@ -15,14 +15,27 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
 
 ### What This Fork Adds (Beyond Upstream `main`):
 
-1. **MXFP8 Tensor-Parallel (TP) Weight Sharding (by @pretor)**:
+1. **Opt-In Layer-Major Long Prefill for Multi-GPU TP=4 (`--prefill-layer-major`)**:
+   - **Upstream Adaptation**: Adapts upstream PR #686 (which only targeted single-GPU TP=1) for multi-GPU TP=4 and resolves multi-chunk activation memory management.
+   - **The Problem It Solves**: Standard chunked prefill divides long contexts into chunks of `--max-extend-length 4096`. For a 32k prompt, 8 chunks traverse all layers sequentially, requiring MoE experts to be re-streamed across PCIe 8 separate times per layer.
+   - **How Layer-Major Works**: Inverts execution order so each decoder layer processes all chunks consecutively while its MoE experts remain resident in GPU VRAM. Experts traverse PCIe only once per layer instead of once per chunk, nearly doubling prefill throughput.
+   - **Zero-Copy VRAM Activation Flow**: Retains chunk intermediate activations directly in VRAM without costly CPU roundtrips, paired with immediate chunk lifecycle cleanup (`hidden.clear()`) and post-prefill cache release (`torch.cuda.empty_cache()`).
+   - **Sampling Resilience on Primary GPUs**: Added automatic fallback to Triton sampling if FlashInfer's raw `cudaMalloc` encounters driver memory fragmentation during non-zero temperature sampling on GPU 0 (which often drives desktop displays).
+   - **Measured Performance on 4x RTX 5060 Ti 16GB**:
+     - **16k Prefill**: **2,082 tok/s** (TTFT: 7.90s, Decode: 63.5 tok/s)
+     - **32k Prefill**: **2,072 tok/s** (TTFT: 15.86s, Decode: 58.7 tok/s)
+     - **64k Prefill**: **1,708 tok/s** (TTFT: 38.44s, Decode: 63.1 tok/s)
+     - **110k Prefill**: **1,600 tok/s** (TTFT: 68.80s, Decode: 60.0 tok/s)
+     - **198k Prefill (99% full 200k KV limit)**: **1,475 tok/s** (TTFT: 134.29s, Decode: 60.2 tok/s)
+
+2. **MXFP8 Tensor-Parallel (TP) Weight Sharding (by @pretor)**:
    - **Custom Implementation**: Created and integrated full Tensor-Parallel (TP4) row/column weight sharding for **MXFP8** dense layers, merger projections, and shared experts.
    - **Why It Matters**: Upstream FreeToken only supported single-GPU (TP=1) or duplicated layouts for MXFP8 weights. This sharding allows modern hybrid checkpoints—which pair NVFP4 routed experts with MXFP8 shared experts—to partition weights cleanly across 4 GPUs, saving precious VRAM and unlocking true multi-GPU scaling.
 
-2. **Vision Tower TP Sharding (Multi-Modal Acceleration)**:
+3. **Vision Tower TP Sharding (Multi-Modal Acceleration)**:
    - Shards vision encoder weights across all TP ranks (`_shard_vision_tensor`), dividing ViT memory to only **~214 MB per GPU** instead of duplicating 856 MB on every card or crashing under TP > 1.
 
-3. **CPU Vision Encoder: the Vision Tower in RAM, Zero VRAM (`--mm-encoder-weights cpu`)**:
+4. **CPU Vision Encoder: the Vision Tower in RAM, Zero VRAM (`--mm-encoder-weights cpu`)**:
    - **What**: image input on Qwen3.8-Flash-Next without spending VRAM. The vision tower (27-block ViT, ~449M params) lives once in host RAM in FP32 and runs in its own CPU process (`freetoken-vision-cpu`, no CUDA device visible), modelled on [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4)'s `strata-vision` sidecar.
    - **How it works**: the tokenizer sends only the requests that carry images to the encoder process. It replaces each image's pixels with the tower's output rows and passes the request on to the scheduler. The 4 TP ranks build and load no tower, so the KV cache and the expert cache keep their full size, and running requests keep decoding while an image encodes. Text-only requests never pass through it.
    - **Why FP32 on the CPU**: these Xeons have no BF16 or AMX units. BF16 was ~2x slower than FP32 and ~11-12% off it at 1024 tokens, the same drift the BF16 GPU tower shows against FP32.
@@ -36,12 +49,12 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
      - End to end: the model reads image content correctly (colours, text in the picture), a resent image comes from the cache, a corrupt image gets a clean 400, and an abort mid-encode is handled.
    - Details: [CPU vision encoder](docs/cli.md#cpu-vision-encoder); benchmark: `benchmarks/bench_cpu_vision.py`.
 
-4. **Pre-Merged Cutting-Edge Upstream PRs**:
+5. **Pre-Merged Cutting-Edge Upstream PRs**:
    - **[PR #635](https://github.com/FlashML-org/FreeToken/pull/635)**: `perf(moe): avoid intra-op fanout while filling NVFP4 host banks` — eliminates intra-op fanout latency when populating host-side NVFP4 expert banks.
    - **[PR #636](https://github.com/FlashML-org/FreeToken/pull/636)**: `feat(quant): opt-in fp8-block QAT for the lm_head` — enables FP8-block quantized LM heads to conserve GPU memory.
    - **[PR #639](https://github.com/FlashML-org/FreeToken/pull/639)**: `feat(server): add --api-key authentication` — adds `--api-key` and `$FREETOKEN_API_KEY` bearer authentication to protect the server endpoint.
 
-5. **Production Stability & 200k Context Resilience**:
+6. **Production Stability & 200k Context Resilience**:
    - Custom timeout flags (`--step-timeout 120`, `--distributed-timeout 2592000`) that prevent NCCL heartbeat and rendezvous timeouts during long idle stretches or heavy prefill batches.
    - Production-verified **FP8 KV-Cache** across up to **200,000 tokens** (~1.31 GiB VRAM per GPU for 200k tokens).
 
@@ -73,7 +86,9 @@ ft checkpoint convert \
   --model local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
   --output /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW
 
-# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 15,000 MoE cache slots, image input on the CPU)
+# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 14,500 MoE cache slots, Layer-Major prefill, image input on CPU)
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 numactl --interleave=all ft serve \
   --model /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW \
   --tp-size 4 \
@@ -84,9 +99,10 @@ numactl --interleave=all ft serve \
   --expert-load serial \
   --embed-device cpu \
   --decode-interleave-every 4 \
-  --moe-cache-size 15000 \
+  --moe-cache-size 14500 \
   --memory-ratio 0.95 \
   --moe-prefill-hit-d2d \
+  --prefill-layer-major \
   --kv-cache-dtype fp8 \
   --num-tokens 200000 \
   --max-seq-len-override 200000 \
@@ -109,7 +125,13 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
     {"type": "text", "text": "What is in this picture?"}]}]}'
 ```
 
-`--mm-encoder-weights cpu` serves images with the vision tower on the CPU (see item 3 above); images are
+> [!TIP]
+> **Key Performance Settings for Long Contexts & Stability:**
+> - `--prefill-layer-major`: Reorders prefill so all chunks run through a layer before advancing, keeping MoE experts resident and accelerating long-context TTFT from ~1,400 tok/s up to **2,082 tok/s**.
+> - `--moe-cache-size 14500` with `--memory-ratio 0.95`: Guarantees a ~115 MiB safety margin on GPU 0 during extreme multi-chunk prefill (up to 198,000 tokens), preventing OOM on primary GPUs driving desktop displays.
+> - `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: Eliminates memory fragmentation spikes during long multi-chunk requests.
+
+`--mm-encoder-weights cpu` serves images with the vision tower on the CPU (see item 4 above); images are
 capped at 1024 tokens unless `--image-max-tokens` is given. For text-only serving, use `--text-model-only`
 instead, which also saves the encoder process's ~2.4 GB of RAM.
 

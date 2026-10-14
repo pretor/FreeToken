@@ -250,7 +250,7 @@ class PrefillAdder:
         # before this drain archives, so a drain-created list would sit on an abandoned Req forever.
         if host_tracks is not None:
             req.mamba_host_tracks = host_tracks
-        elif self.cache_manager.mamba_host_enabled:
+        elif getattr(self.cache_manager, "mamba_host_enabled", False):
             req.mamba_host_tracks = []
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         return req

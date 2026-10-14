@@ -356,7 +356,7 @@ class OffloadMoELayer(MoELayer):
         position == expert id, so the routing ids pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.loads_prefill_on_demand(hidden_states.shape[0]):
+        if cache.loads_prefill_on_demand(hidden_states.shape[0]) and not getattr(get_global_ctx().batch, "skip_begin_prefill", False):
             slots = cache.load_prefill_experts(self.layer_id, topk_ids)
             unique_slots, compact_ids = torch.unique(slots, return_inverse=True)
             u = int(unique_slots.numel())

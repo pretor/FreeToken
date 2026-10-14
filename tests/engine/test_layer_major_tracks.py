@@ -81,15 +81,16 @@ def test_layer_major_flag_defaults_off():
     ("enabled", "model_type", "tp_size", "strategy", "expert_quant", "ple_backend", "expected"),
     [
         (True, "qwen4_exp", 1, "offload", "nvfp4", "pinned", True),
+        (True, "qwen4_exp", 4, "offload", "nvfp4", "pinned", True),
         (False, "qwen4_exp", 1, "offload", "nvfp4", "pinned", False),
         (True, "qwen3_5", 1, "offload", "nvfp4", "pinned", False),
-        (True, "qwen4_exp", 2, "offload", "nvfp4", "pinned", False),
+        (True, "qwen4_exp", 16, "offload", "nvfp4", "pinned", False),
         (True, "qwen4_exp", 1, "none", "nvfp4", "pinned", False),
         (True, "qwen4_exp", 1, "offload", "fp8", "pinned", False),
         (True, "qwen4_exp", 1, "offload", "nvfp4", "disk", False),
         (True, "qwen4_exp", 1, "offload", "nvfp4", "auto", False),
     ],
-    ids=["eligible", "flag-off", "other-model", "tp", "other-strategy", "other-format", "disk-ple", "auto-ple"],
+    ids=["eligible", "eligible-tp4", "flag-off", "other-model", "unsupported-tp", "other-strategy", "other-format", "disk-ple", "auto-ple"],
 )
 def test_layer_major_runtime_gate_rejects_every_unsupported_mode(
     enabled, model_type, tp_size, strategy, expert_quant, ple_backend, expected,

@@ -57,7 +57,7 @@ def _supports_layer_major_prefill(config: SchedulerConfig) -> bool:
     return bool(
         getattr(config, "prefill_layer_major", False)
         and model_config.model_type == "qwen4_exp"
-        and config.tp_info.size == 1
+        and config.tp_info.size in (1, 2, 4, 8)
         and config.moe_strategy == "offload"
         and getattr(model_config, "expert_quant", None) == "nvfp4"
         and getattr(config, "ple_backend", None) == "pinned"
@@ -124,7 +124,7 @@ class Scheduler(SchedulerIOMixin):
         self.layer_major = _supports_layer_major_prefill(config)
         if getattr(config, "prefill_layer_major", False) and not self.layer_major:
             logger.warning_rank0(
-                "--prefill-layer-major requires Qwen3.8 text, TP=1, NVFP4 GPU offload, and the pinned PLE backend; using ordinary chunked prefill"
+                "--prefill-layer-major requires Qwen3.8 text, TP in [1, 2, 4, 8], NVFP4 GPU offload, and the pinned PLE backend; using ordinary chunked prefill"
             )
         self.prefill_manager.layer_major = self.layer_major
 

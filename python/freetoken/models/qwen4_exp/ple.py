@@ -702,8 +702,20 @@ class PLELayer(BaseOP):
 
         state = self._read_state(meta, states, x.dtype)
         history = x.new_empty(width, x.shape[0] + num_reqs * self.state_len)
-        history.index_copy_(1, state_index, state.permute(1, 0, 2).reshape(width, -1))
-        history.index_copy_(1, out_index + self.state_len, x.transpose(0, 1).contiguous())
+        if num_reqs == 1:
+            history[:, : self.state_len].copy_(state[0])
+            history[:, self.state_len :].copy_(x.t())
+        else:
+            counts = torch.tensor(lens, dtype=torch.int64)
+            cu = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+            pad = torch.arange(len(lens), dtype=torch.int64) * self.state_len
+            base = cu[:-1] + pad
+            offset = 0
+            for i, n in enumerate(lens):
+                b = int(base[i])
+                history[:, b : b + self.state_len].copy_(state[i])
+                history[:, b + self.state_len : b + self.state_len + n].copy_(x[offset : offset + n].t())
+                offset += n
 
         out = F.conv1d(
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation

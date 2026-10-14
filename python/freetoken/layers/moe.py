@@ -358,14 +358,21 @@ class OffloadMoELayer(MoELayer):
         assert cache is not None
         if cache.loads_prefill_on_demand(hidden_states.shape[0]):
             slots = cache.load_prefill_experts(self.layer_id, topk_ids)
+            unique_slots, compact_ids = torch.unique(slots, return_inverse=True)
+            u = int(unique_slots.numel())
+            compact_ids = compact_ids.view_as(slots).to(torch.int32)
+            active_views = tuple(b[unique_slots] for b in cache.bank_views())
+            alphas = cache.alphas_for_slots(self.layer_id)
+            if alphas is not None:
+                alphas = (alphas[0][unique_slots], alphas[1][unique_slots])
             return self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
-                slots,
-                views=cache.bank_views(),
-                n=cache.cache_size,
-                alphas=cache.alphas_for_slots(self.layer_id),
+                compact_ids,
+                views=active_views,
+                n=u,
+                alphas=alphas,
                 is_prefill=True,
             )
         if cache.prefill_overlap:

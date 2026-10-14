@@ -176,9 +176,9 @@ def test_offload_moe_layer_short_prefill_loads_its_experts_through_the_slot_cach
     assert not any(record_stats for *_, record_stats in admissions)
     assert int(cache.decode_freq.sum()) == 0
     assert out is hidden_states
-    # the grouped GEMM reads the whole slot cache at the slots the admission wrote
-    assert calls["w1"].shape[0] == cache.cache_size
-    assert torch.equal(calls["topk_ids"], cache.cache_size - 1 - routes[:96])
+    # Option 4: the grouped GEMM reads only the active unique slots in this chunk
+    assert calls["w1"].shape[0] == 160
+    assert calls["topk_ids"].max() < 160
 
     events.clear()
     layer.prefill_forward(torch.randn(97, 8), torch.randn(97, 160))

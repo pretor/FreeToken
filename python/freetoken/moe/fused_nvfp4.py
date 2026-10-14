@@ -323,14 +323,17 @@ def fused_experts_nvfp4(
     )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
     gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
+    del ic1
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,
         tw, sorted_ids, expert_ids, ntpp, num_valid, 1,
         not apply_router_weight_on_input, cfg,
     )
+    del ic2
     out = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(ic3, out)
+    del ic3
     return out
 
 

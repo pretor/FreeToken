@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from freetoken import launch
@@ -72,6 +75,10 @@ def test_cors_preflight_passes_and_401_carries_cors_headers():
     assert denied.headers["access-control-allow-origin"] == ORIGIN
 
 
+def test_options_outside_a_cors_preflight_needs_the_key():
+    assert _client(KEY).options("/v1/models").status_code == 401
+
+
 def test_flag_wins_over_env_and_empty_values_do_not_enable_auth(monkeypatch):
     monkeypatch.delenv("FREETOKEN_API_KEY", raising=False)
     assert _parse().api_key is None
@@ -99,3 +106,41 @@ def test_dry_run_prints_a_placeholder_instead_of_the_key(agent, monkeypatch, cap
     assert key not in out and json.dumps(key)[1:-1] not in out
     if agent in ("claude", "codex", "dsh", "opencode"):
         assert "<api-key>" in out
+
+
+def test_dsh_keeps_the_key_out_of_the_variable_its_web_search_reads(monkeypatch, tmp_path):
+    monkeypatch.setenv("DSH_HOME", str(tmp_path))
+    monkeypatch.setattr(launch, "_warn_dsh_node_version", lambda: None)
+    ctx = launch.LaunchContext(
+        server=launch.resolve_server_url("http://127.0.0.1:1919"),
+        model=launch.ServedModel(model_id="m", models=["m"], context_length=8192),
+        extra_args=[],
+        dry_run=False,
+        api_key=KEY,
+    )
+    env = launch.prepare_dsh(ctx).env
+    settings = yaml.safe_load((tmp_path / launch.DSH_LAUNCH_SETTINGS_NAME).read_text())
+    assert env["DEEPSEEK_API_KEY"] != KEY
+    assert env[settings["llm-deepseek"]["apiKeyEnv"]] == KEY
+
+
+@pytest.mark.parametrize("agent", ["hermes", "openclaw"])
+def test_config_files_holding_the_key_are_owner_only(agent, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old_umask = os.umask(0o022)
+    try:
+        for key in ("sk-first", "sk-second"):
+            ctx = launch.LaunchContext(
+                server=launch.resolve_server_url("http://127.0.0.1:1919"),
+                model=launch.ServedModel(model_id="m", models=["m"], context_length=65536),
+                extra_args=[],
+                dry_run=False,
+                assume_yes=True,
+                api_key=key,
+            )
+            launch.PREPARERS[agent](ctx)
+    finally:
+        os.umask(old_umask)
+    written = [p for p in tmp_path.rglob("*") if p.is_file() and "sk-" in p.read_text()]
+    assert len(written) == 2
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in written)

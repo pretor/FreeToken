@@ -60,10 +60,6 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
-# The longest a stream stays silent before it sends an SSE comment. A long prompt prefills for
-# minutes before its first token, and clients time an idle body out (Node's fetch after 300 s).
-STREAM_KEEPALIVE_SECONDS = 15.0
-_STREAM_KEEPALIVE = b": keep-alive\n\n"
 
 
 def get_global_state() -> FrontendManager:
@@ -366,33 +362,16 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
-        """Relay ``generator``'s SSE chunks; while it is silent (a long prefill), send a comment every
-        ``STREAM_KEEPALIVE_SECONDS`` and abort the request if the client has gone."""
-        chunks = generator.__aiter__()
-        pending: asyncio.Future | None = None
         try:
-            while True:
-                if pending is None:
-                    pending = asyncio.ensure_future(chunks.__anext__())
-                done, _ = await asyncio.wait({pending}, timeout=STREAM_KEEPALIVE_SECONDS)
+            async for chunk in generator:
+                # detect if the client has disconnected
                 if await request.is_disconnected():
                     logger.info("Client disconnected for user %s", uid)
                     raise asyncio.CancelledError
-                if not done:
-                    yield _STREAM_KEEPALIVE
-                    continue
-                try:
-                    chunk = pending.result()
-                except StopAsyncIteration:
-                    return
-                pending = None
                 yield chunk
         except asyncio.CancelledError:
             asyncio.create_task(self.abort_user(uid))
             raise
-        finally:
-            if pending is not None and not pending.done():
-                pending.cancel()
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
@@ -442,8 +421,6 @@ def install_cors(app: FastAPI, origins_csv: str) -> None:
 
 
 class _ApiKeyMiddleware:
-    """Answer 401 unless the request carries the key, except /health and OPTIONS requests."""
-
     def __init__(self, app, api_key: str) -> None:
         self.app = app
         self._digest = hashlib.sha256(api_key.encode()).digest()
@@ -455,11 +432,7 @@ class _ApiKeyMiddleware:
         )
 
     async def __call__(self, scope, receive, send) -> None:
-        if (
-            scope["type"] not in ("http", "websocket")
-            or scope.get("method") == "OPTIONS"
-            or scope["path"] == "/health"
-        ):
+        if scope["type"] not in ("http", "websocket") or scope["path"] == "/health":
             return await self.app(scope, receive, send)
         headers = Headers(scope=scope)
         scheme, _, token = headers.get("authorization", "").partition(" ")
@@ -471,7 +444,9 @@ class _ApiKeyMiddleware:
 
 
 def install_api_key(app: FastAPI, api_key: str | None) -> None:
-    """Require ``api_key`` on every route but /health; run before install_cors so 401s get CORS headers."""
+    """Require ``api_key`` on every route but /health.
+
+    Run it before install_cors, so CORS answers preflights and adds its headers to 401s."""
     if api_key is None:
         return
     app.add_middleware(_ApiKeyMiddleware, api_key=api_key)

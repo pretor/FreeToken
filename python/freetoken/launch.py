@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -248,15 +249,22 @@ def _backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.{time.time_ns()}.bak")
 
 
-def _write_text_with_backup(path: Path, text: str) -> None:
+def _write_text_with_backup(path: Path, text: str, *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text() != text:
-        shutil.copy2(path, _backup_path(path))
+        backup = _backup_path(path)
+        # copy2 sets the mode only after it copies the content, so create the backup with the source mode first
+        backup.touch(mode=stat.S_IMODE(path.stat().st_mode))
+        shutil.copy2(path, backup)
+    if private:
+        # before the write, so the key never sits in a file others can read
+        path.touch(mode=0o600)
+        path.chmod(0o600)
     path.write_text(text)
 
 
-def _write_json_with_backup(path: Path, value: object) -> None:
-    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n")
+def _write_json_with_backup(path: Path, value: object, *, private: bool = False) -> None:
+    _write_text_with_backup(path, json.dumps(value, indent=2) + "\n", private=private)
 
 
 def _toml_string(value: str) -> str:
@@ -676,7 +684,9 @@ def prepare_openclaw(ctx: LaunchContext) -> CommandSpec:
         if not _openclaw_has_freetoken_provider(config):
             if not ctx.assume_yes and not _confirm_openclaw_first_patch(ctx, config_path):
                 raise RuntimeError("OpenClaw config patch cancelled")
-        _write_json_with_backup(config_path, _patch_openclaw_config(ctx, config))
+        _write_json_with_backup(
+            config_path, _patch_openclaw_config(ctx, config), private=bool(ctx.api_key)
+        )
         _clear_openclaw_session_overrides(ctx.model.model_id)
 
     argv = ["openclaw", *ctx.extra_args] if ctx.extra_args else ["openclaw", "chat"]
@@ -727,7 +737,9 @@ def prepare_hermes(ctx: LaunchContext) -> CommandSpec:
                 file=sys.stderr,
             )
 
-        _write_text_with_backup(config_path, yaml.safe_dump(config, sort_keys=False))
+        _write_text_with_backup(
+            config_path, yaml.safe_dump(config, sort_keys=False), private=bool(ctx.api_key)
+        )
 
     argv = ["hermes", *ctx.extra_args] if ctx.extra_args else ["hermes", "chat"]
     return CommandSpec(argv=argv, env={})
@@ -767,9 +779,8 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     replays tool-call arguments byte-verbatim and reasoning as
     ``reasoning_content``, while llm-pi-ai's JSON round-trip can change argument
     values and key order — drift that survives render canonicalization, cuts
-    the prefix cache, and shows the model a rewrite of its own output. Without
-    an API key, the dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key
-    requirement."""
+    the prefix cache, and shows the model a rewrite of its own output. The
+    dummy DEEPSEEK_API_KEY satisfies dsh's non-empty key requirement."""
     settings_path = _dsh_home() / DSH_LAUNCH_SETTINGS_NAME
     patch_path = _dsh_home() / DSH_LAUNCH_PATCH_NAME
     if not ctx.dry_run:
@@ -789,7 +800,7 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
 
         window, output = _context_window(ctx), _max_output_tokens(ctx)
         modalities = ["text", "image"] if _accepts_images(ctx) else ["text"]
-        config["llm-deepseek"] = {
+        section: dict[str, object] = {
             "baseURL": ctx.server.openai_base_url,
             "models": [
                 {
@@ -802,6 +813,10 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
                 for model_id in _ordered_model_ids(ctx)
             ],
         }
+        if ctx.api_key:
+            # not DEEPSEEK_API_KEY: dsh's web search also reads it and sends it to api.deepseek.com
+            section["apiKeyEnv"] = API_KEY_ENV
+        config["llm-deepseek"] = section
         config["agent-default-model"] = {
             "provider": "deepseek-official",
             "model": ctx.model.model_id,
@@ -819,15 +834,14 @@ def prepare_dsh(ctx: LaunchContext) -> CommandSpec:
     elif len(app_args) >= 2 and app_args[0] == "--profile":
         profile, app_args = app_args[1], app_args[2:]
     argv = ["dsh", "--profile", profile, "--patch", str(patch_path), *app_args]
-    return CommandSpec(
-        argv=argv,
-        env={
-            "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
-            "DEEPSEEK_API_KEY": ctx.api_key or DSH_API_KEY,
-            "DSH_TELEMETRY_DISABLED": "1",
-        },
-        unset_env=CLOUD_PROVIDER_API_KEY_ENV,
-    )
+    env = {
+        "DEEPSEEK_BASE_URL": ctx.server.openai_base_url,
+        "DEEPSEEK_API_KEY": DSH_API_KEY,
+        "DSH_TELEMETRY_DISABLED": "1",
+    }
+    if ctx.api_key:
+        env[API_KEY_ENV] = ctx.api_key
+    return CommandSpec(argv=argv, env=env, unset_env=CLOUD_PROVIDER_API_KEY_ENV)
 
 
 PREPARERS = {

@@ -44,7 +44,7 @@ def _nvfp4_entry(value: str) -> str:
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
     server_port: int = 1919
-    # None serves without authentication; kept out of repr so a logged config never shows it
+    # kept out of repr: parse_args logs the whole ServerArgs
     api_key: str | None = field(default=None, repr=False)
     num_tokenizer: int = 0
     silent_output: bool = False
@@ -868,7 +868,7 @@ def parse_args(
             "only, where CUDA pinned memory is capped: it locks just enough head+tail layers "
             "for the banks over the pin budget. Any value, 'auto' included, commits to CPU "
             "decode before the model is built, so the expert format must have a CPU executor "
-            "path (bf16, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
+            "path (bf16, fp8_block, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
             "GPU; a boot whose banks exceed a known pin budget stops and asks for this flag."
         ),
     )

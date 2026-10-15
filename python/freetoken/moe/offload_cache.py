@@ -743,9 +743,9 @@ class OffloadMoeCache:
         self.down_alpha = down_alpha.to(self.device)
 
     def preseed(self) -> int:
-        """Pre-seed the hit region of the GPU slot cache [2*E, cache_size) with experts from bank_sources.
+        """Pre-seed the hit region of the GPU slot cache with experts from bank_sources.
 
-        Equally partitions available slots across all layers.
+        Partitions available stable slots across each pool's layers.
         When prefill-hit-d2d is active, these resident experts are gathered D2D directly within VRAM,
         cutting PCIe transfers by up to (available_slots / total_model_experts)%.
         Initializes usage to 1 so decode LRU can naturally evict them if needed.
@@ -753,43 +753,52 @@ class OffloadMoeCache:
         if not self.banks:
             return 0
         E = self.num_experts
-        start_slot = 2 * E
-        total_slots = self.cache_size - start_slot
-        if total_slots <= 0:
-            return 0
 
-        experts_per_layer = min(E, total_slots // self.num_layers)
-        if experts_per_layer <= 0:
-            return 0
+        pool_layers = [[] for _ in range(len(self.pool_sizes))]
+        for l, p in enumerate(self.pool_of_layer):
+            if l not in self._unpinned_layers:
+                pool_layers[p].append(l)
 
-        current_slot = start_slot
-        for layer_id in range(self.num_layers):
-            if layer_id in self._unpinned_layers:
+        seeded_count = 0
+        for p, layers in enumerate(pool_layers):
+            if not layers:
                 continue
-            num_e = min(experts_per_layer, self.cache_size - current_slot)
-            if num_e <= 0:
-                break
-
-            for e in range(num_e):
-                slot = current_slot + e
-                self.slot_for_id[layer_id, e] = slot
-                self.id_of_slot[slot] = layer_id * E + e
-                self.usage[slot] = 1
-
-            for per_layer, cache in self.banks:
-                src = per_layer[layer_id][:num_e]
-                cache[current_slot : current_slot + num_e].copy_(src, non_blocking=True)
-
-            current_slot += num_e
+            base = self.pool_bases[p]
+            pool_size = self.pool_sizes[p]
+            stable_from = self._pool_stable_from[p]
+            avail = max(0, pool_size - stable_from)
+            if avail <= 0:
+                continue
+            experts_per_layer = min(E, avail // len(layers))
+            if experts_per_layer <= 0:
+                continue
+            current_local = stable_from
+            for layer_id in layers:
+                num_e = min(experts_per_layer, pool_size - current_local)
+                if num_e <= 0:
+                    break
+                for e in range(num_e):
+                    local_slot = current_local + e
+                    global_slot = base + local_slot
+                    self.slot_for_id[layer_id, e] = local_slot
+                    self.id_of_slot[global_slot] = layer_id * E + e
+                    self.usage[global_slot] = 1
+                pool_views = self.pool_bank_views(layer_id)
+                for (per_layer, _), view in zip(self.banks, pool_views):
+                    src = per_layer[layer_id][:num_e]
+                    view[current_local : current_local + num_e].copy_(src, non_blocking=True)
+                current_local += num_e
+                seeded_count += num_e
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
-        seeded_count = current_slot - start_slot
         self._preseeded = True
+        total_model_experts = self.num_layers * E
+        pct = 100.0 * seeded_count / total_model_experts if total_model_experts else 0.0
         logger.info_rank0(
             f"MoE cache pre-seeded {seeded_count} experts across {self.num_layers} layers "
-            f"({experts_per_layer} experts/layer = {100.0 * experts_per_layer / E:.1f}% hit floor)"
+            f"({seeded_count / self.num_layers:.1f} experts/layer avg = {pct:.1f}% hit floor)"
         )
         return seeded_count
 

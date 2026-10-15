@@ -366,7 +366,7 @@ class OffloadMoELayer(MoELayer):
             unique_slots, compact_ids = torch.unique(slots, return_inverse=True)
             u = int(unique_slots.numel())
             compact_ids = compact_ids.view_as(slots).to(torch.int32)
-            active_views = tuple(b[unique_slots] for b in cache.bank_views())
+            active_views = tuple(b[unique_slots] for b in cache.pool_bank_views(self.layer_id))
             alphas = cache.alphas_for_slots(self.layer_id)
             if alphas is not None:
                 alphas = (alphas[0][unique_slots], alphas[1][unique_slots])

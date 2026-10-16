@@ -773,36 +773,49 @@ class OffloadMoeCache:
             if l not in self._unpinned_layers:
                 pool_layers[p].append(l)
 
-        seeded_count = 0
-        for p, layers in enumerate(pool_layers):
-            if not layers:
-                continue
-            base = self.pool_bases[p]
-            pool_size = self.pool_sizes[p]
-            stable_from = self._pool_stable_from[p]
-            avail = max(0, pool_size - stable_from)
+        def _seed_span(
+            p: int, layers: list[int], span_start: int, span_end: int, e_offsets: list[int]
+        ) -> int:
+            avail = max(0, span_end - span_start)
             if avail <= 0:
-                continue
+                return 0
             experts_per_layer = min(E, avail // len(layers))
             if experts_per_layer <= 0:
-                continue
-            current_local = stable_from
-            for layer_id in layers:
-                num_e = min(experts_per_layer, pool_size - current_local)
+                return 0
+            base = self.pool_bases[p]
+            current_local = span_start
+            count = 0
+            for idx, layer_id in enumerate(layers):
+                e0 = e_offsets[idx]
+                num_e = min(experts_per_layer, span_end - current_local, E - e0)
                 if num_e <= 0:
-                    break
-                for e in range(num_e):
-                    local_slot = current_local + e
+                    continue
+                for i in range(num_e):
+                    e = e0 + i
+                    local_slot = current_local + i
                     global_slot = base + local_slot
                     self.slot_for_id[layer_id, e] = local_slot
                     self.id_of_slot[global_slot] = layer_id * E + e
                     self.usage[global_slot] = 1
                 pool_views = self.pool_bank_views(layer_id)
                 for (per_layer, _), view in zip(self.banks, pool_views):
-                    src = per_layer[layer_id][:num_e]
+                    src = per_layer[layer_id][e0 : e0 + num_e]
                     view[current_local : current_local + num_e].copy_(src, non_blocking=True)
                 current_local += num_e
-                seeded_count += num_e
+                e_offsets[idx] += num_e
+                count += num_e
+            return count
+
+        seeded_count = 0
+        for p, layers in enumerate(pool_layers):
+            if not layers:
+                continue
+            pool_size = self.pool_sizes[p]
+            stable_from = self._pool_stable_from[p]
+            e_offsets = [0] * len(layers)
+            seeded_count += _seed_span(p, layers, stable_from, pool_size, e_offsets)
+            if len(self.pool_sizes) > 1 and stable_from > 0:
+                seeded_count += _seed_span(p, layers, 0, min(stable_from, pool_size), e_offsets)
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -888,12 +901,21 @@ class OffloadMoeCache:
     def _invalidate_prefill_buffer(self, buffer_id: int, layer_id: int) -> None:
         """Take buffer ``buffer_id``'s slots for staging ``layer_id``."""
         slots = self._inval[buffer_id]
-        old_ids = self.id_of_slot[slots]
-        self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
-        self.id_of_slot[slots] = -1
-        # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
-        # ensure_experts evicts them first.
-        self.usage[slots] = 0
+        if isinstance(slots, slice):
+            n = (slots.stop or 0) - (slots.start or 0)
+            if n > 0:
+                from freetoken.kernel.triton.moe.invalidate import invalidate_prefill_slots
+
+                invalidate_prefill_slots(
+                    self.id_of_slot, self.slot_for_id, self.usage, slots.start or 0, n
+                )
+        else:
+            old_ids = self.id_of_slot[slots]
+            self.slot_for_id.view(-1)[old_ids[old_ids >= 0].long()] = -1
+            self.id_of_slot[slots] = -1
+            # usage=0 makes these slots the oldest, so the argmin(usage) victim selection in
+            # ensure_experts evicts them first.
+            self.usage[slots] = 0
         self._stage_dirty[buffer_id] = True
         # the pad may hold rows of a wider layout or of a pool
         for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
@@ -1119,6 +1141,8 @@ class OffloadMoeCache:
             self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
+        if layer_id == self.num_layers - 1:
+            self._prefill_buffer_layer = [None, None]
 
     def loads_prefill_on_demand(self, num_tokens: int) -> bool:
         return 0 < num_tokens <= self.prefill_demand_tokens

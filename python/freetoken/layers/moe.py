@@ -354,9 +354,12 @@ class OffloadMoELayer(MoELayer):
         longer one streams whole layers -- double-buffered behind the previous layer's GEMMs
         when ``prefill_overlap`` is on, else a synchronous ``materialize_layer`` -- where
         position == expert id, so the routing ids pass through unmapped."""
+        from freetoken import core
+
+        batch = core._GLOBAL_CTX.batch if core._GLOBAL_CTX is not None else None
         cache = self.offload_cache
         assert cache is not None
-        if cache.loads_prefill_on_demand(hidden_states.shape[0]) and not getattr(get_global_ctx().batch, "skip_begin_prefill", False):
+        if cache.loads_prefill_on_demand(hidden_states.shape[0]) and not getattr(batch, "skip_begin_prefill", False):
             slots = cache.load_prefill_experts(self.layer_id, topk_ids)
             unique_slots, compact_ids = torch.unique(slots, return_inverse=True)
             u = int(unique_slots.numel())
@@ -387,7 +390,8 @@ class OffloadMoELayer(MoELayer):
                 alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=True,
             )
-            cache.release_prefill_layer(self.layer_id)
+            if not getattr(batch, "defer_release_prefill", False):
+                cache.release_prefill_layer(self.layer_id)
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
@@ -401,7 +405,8 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
-        cache.release_prefill_layer(self.layer_id)
+        if not getattr(batch, "defer_release_prefill", False):
+            cache.release_prefill_layer(self.layer_id)
         return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
@@ -410,7 +415,10 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0 and not getattr(get_global_ctx().batch, "skip_begin_prefill", False):
+        from freetoken import core
+
+        batch = core._GLOBAL_CTX.batch if core._GLOBAL_CTX is not None else None
+        if self.layer_id == 0 and not getattr(batch, "skip_begin_prefill", False):
             cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
         cache.prefetch_prefill_layer(self.layer_id + 1)

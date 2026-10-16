@@ -1344,8 +1344,11 @@ class Engine:
                     projections += 1
             self.attn_backend.prepare_metadata(child)
             child.skip_begin_prefill = True
+            child.defer_release_prefill = True
             chunks.append(child)
             lo = hi
+        if chunks:
+            chunks[-1].defer_release_prefill = False
         if track is not None:
             assert projections == 1, f"layer-major track projected {projections} times"
         return chunks

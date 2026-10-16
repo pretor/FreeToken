@@ -121,7 +121,7 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
     Otherwise the first replay pushes every node behind the graph's own stream WAIT, and a large graph then blocks cudaGraphLaunch until the WAIT is released. PLE wait-sync releases it only after the launch returns, so that deadlocks.
     """
     upload = _cu_graph_upload()
-    if upload is None:
+    if upload is None or stream is None or not hasattr(graph, "raw_cuda_graph_exec"):
         return
     rc = upload(graph.raw_cuda_graph_exec(), stream.cuda_stream)
     if rc != 0:

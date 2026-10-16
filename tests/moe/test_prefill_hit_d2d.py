@@ -171,3 +171,84 @@ def test_prefill_preseed():
             assert torch.equal(view.cpu(), per_layer[layer_id]), f"Mismatch on {layer_id} {name}"
         cache.release_prefill_layer(layer_id)
     assert cache._chunk_hit_rows == 6
+
+
+@CUDA
+@JIT
+@BATCH_API
+def test_prefill_preseed_per_layer_pools_seeds_all_layers():
+    dev = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.randn(E, 32, 8, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+        "down": [torch.randn(E, 8, 16, dtype=torch.bfloat16).pin_memory() for _ in range(NUM_LAYERS)],
+    }
+    cache = OffloadMoeCache(
+        num_layers=NUM_LAYERS,
+        num_experts=E,
+        cache_size=24,
+        device=dev,
+        prefill_overlap=True,
+        prefill_hit_d2d=True,
+        pool_of_layer=[0, 1, 2],
+        pool_sizes=[6, 6, 12],
+    )
+    cache.set_bank_sources(sources)
+    seeded = cache.preseed()
+    assert seeded == 20
+    for layer_id, expected in enumerate([6, 6, 8]):
+        assert int((cache.slot_for_id[layer_id] >= 0).sum().item()) == expected
+    cache.begin_prefill()
+    for layer_id in range(NUM_LAYERS):
+        cache.prefetch_prefill_layer(layer_id)
+        views = cache.wait_prefill_layer(layer_id)
+        torch.cuda.synchronize()
+        for view, (name, per_layer) in zip(views, sources.items()):
+            assert torch.equal(view.cpu(), per_layer[layer_id]), f"Mismatch on {layer_id} {name}"
+        cache.release_prefill_layer(layer_id)
+
+
+@CUDA
+def test_layer_major_multi_chunk_preserves_last_layer_staging_buffer():
+    import types
+    import freetoken.core as core
+    from freetoken.distributed import set_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+    set_tp_info(rank=0, size=1)
+
+    cache, sources = _make_cache()
+    ctx = core.Context(page_size=1)
+    old_ctx = core._GLOBAL_CTX
+    core._GLOBAL_CTX = ctx
+    try:
+        layers = [
+            OffloadMoELayer(
+                num_experts=E,
+                top_k=2,
+                hidden_size=8,
+                intermediate_size=16,
+                layer_id=l,
+            )
+            for l in range(NUM_LAYERS)
+        ]
+        for layer in layers:
+            layer.offload_cache = cache
+
+        chunks = [
+            types.SimpleNamespace(skip_begin_prefill=True, defer_release_prefill=True),
+            types.SimpleNamespace(skip_begin_prefill=True, defer_release_prefill=False),
+        ]
+        cache.begin_prefill()
+        for l, layer in enumerate(layers):
+            for c_idx, chunk in enumerate(chunks):
+                with ctx.forward_batch(chunk):
+                    views = layer._wait_prefill_overlap(cache)
+                    torch.cuda.synchronize()
+                    for view, (name, per_layer) in zip(views, sources.items()):
+                        assert torch.equal(view.cpu(), per_layer[l]), (
+                            f"Layer {l} chunk {c_idx} bank {name} corrupted"
+                        )
+                    if not getattr(ctx.batch, "defer_release_prefill", False):
+                        cache.release_prefill_layer(l)
+        assert cache._prefill_buffer_layer == [None, None]
+    finally:
+        core._GLOBAL_CTX = old_ctx

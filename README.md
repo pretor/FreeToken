@@ -11,7 +11,7 @@ Unlock datacenter-class intelligence on the hardware you already own — Run 290
 
 ## This Fork: 4x RTX 5060 Ti & Consumer Multi-GPU Optimization
 
-This fork by **[@pretor](https://github.com/pretor)** is specifically engineered and battle-tested for high-throughput serving of frontier MoE architectures on consumer multi-GPU workstations (specifically **4x NVIDIA GeForce RTX 5060 Ti 16GB** over PCIe 4.0, without NVLink or P2P).
+This fork by **[@pretor](https://github.com/pretor)** is specifically engineered and battle-tested for high-throughput serving of frontier MoE architectures on consumer multi-GPU workstations (specifically **4x NVIDIA GeForce RTX 5060 Ti 16GB** over PCIe 3.0, without NVLink or P2P).
 
 ### What This Fork Adds (Beyond Upstream `main`):
 
@@ -58,6 +58,22 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
    - Custom timeout flags (`--step-timeout 120`, `--distributed-timeout 2592000`) that prevent NCCL heartbeat and rendezvous timeouts during long idle stretches or heavy prefill batches.
    - Production-verified **FP8 KV-Cache** across up to **200,000 tokens** (~1.31 GiB VRAM per GPU for 200k tokens).
 
+7. **Prefill PCIe overlap (`FREETOKEN_PREFILL_COPY_DEFER`, `FREETOKEN_MOE_AR_GROUP`)**:
+   - **The link**: on the ThinkStation P920 the four 5060 Ti cards have no P2P. The TP all-reduce of the bf16 hidden state `[T, 2560]` and the expert H2D copies share the host and PCIe 3.0 (the slots are x16-capable and often come up at x8 while idle). A microbench of a 21 MiB all-reduce against a 150 MiB H2D slowed both at once: all-reduce **+39%**, H2D **+35%**. On a 16k prefill the all-reduce is about half the chunk, the expert copies take about **2.1 s**, and the compute stream waits on those copies for only **~50 ms**. The copies are already mostly hidden. The all-reduce is the exposed PCIe cost.
+   - **`FREETOKEN_PREFILL_COPY_DEFER=prev_ar`** (default `off`): double-buffered prefetch of the next layer's experts used to start when the current layer's GEMMs finished, so that H2D sat on the wire together with the MoE all-reduce. `prev_ar` records the buffer-release event in `mark_layer_reduced`, after the all-reduce is queued, and the next copy starts once the reduce has the link. `off` keeps the copy at release time.
+   - **`FREETOKEN_MOE_AR_GROUP`** (default `0`, one all-reduce for the whole chunk; production uses `2048`): the capy-flash T62 overlap, with the payload left in bf16. A prefill chunk is split into token groups, so a 4096-token extend is two groups. Each group's routed GEMM stays on the compute stream and that group's all-reduce runs on a side stream. PyNCCL is aimed at that stream with `tvm_ffi.use_torch_stream`, because the kernel launches on `TVMFFIEnvGetStream`. The next group's GEMM therefore covers the previous group's all-reduce. The last group of a layer stays exposed: the next layer needs the reduced hidden state. `mark_layer_reduced` runs after the compute stream has waited for every group, so `prev_ar` still starts the next copy after this layer's all-reduces.
+   - **Measured** on the production shape (layer-major prefill, hit-D2D, `--moe-cache-size 14500`, demand-prefill 512, FP8 KV reserved at 200k, `--max-extend-length 4096`), Qwen3.8-Flash-Next NVFP4, TP=4. `prev_ar` alone, against `off`: **64k prefill 1687 → 1795 tok/s (+6.4%)**; 4k and 16k flat; greedy text identical. Grouped all-reduce `2048` on top of `prev_ar`, three reps (the first 4k rep hit the radix cache and is left out of these means):
+
+     | prompt | `FREETOKEN_MOE_AR_GROUP=0` | `2048` |
+     | --- | --- | --- |
+     | 4k | 1621 tok/s | 1635 tok/s (+0.8%) |
+     | 16k | 2057 tok/s | 2164 tok/s (+5.2%) |
+     | 64k | 1797 tok/s | 1852 tok/s (+3.1%) |
+
+     With both switches on, 64k prefill moves from **1687 tok/s** before either change to **1852 tok/s**. The first generated token stayed `We`. Greedy continuations on the grouped path stayed close to the ungrouped run; overlapping the all-reduce onto another stream changes reduction order, so the text can differ.
+   - **Measured and left out of the tree**: capy-flash cache policies (`lru_admit`, a frequency admission, and `fr`) on this per-layer cache (~302 of 512 experts resident, hit-D2D **54.8%**). Prefill and decode throughput did not move. Decode stayed ~60 tok/s with about 10–14 expert misses per token. A literal capy-style `ar` defer, recording the copy release at a different point than `prev_ar`, was slower than `prev_ar`.
+   - **Tests**: `tests/moe/test_prefill_copy_defer.py`, `tests/moe/test_moe_ar_group.py`. Both paths stay off unless the env vars are set.
+
 ---
 
 ### Tested & Verified Models:
@@ -87,7 +103,11 @@ ft checkpoint convert \
   --output /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW
 
 # 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 14,500 MoE cache slots, Layer-Major prefill, image input on CPU)
+#    prev_ar keeps expert H2D off the wire until the MoE all-reduce is queued.
+#    MOE_AR_GROUP=2048 overlaps that all-reduce with the next token group's GEMM.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export FREETOKEN_PREFILL_COPY_DEFER=prev_ar
+export FREETOKEN_MOE_AR_GROUP=2048
 
 numactl --interleave=all ft serve \
   --model /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW \
@@ -130,6 +150,7 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 > - `--prefill-layer-major`: Reorders prefill so all chunks run through a layer before advancing, keeping MoE experts resident and accelerating long-context TTFT from ~1,400 tok/s up to **2,082 tok/s**.
 > - `--moe-cache-size 14500` with `--memory-ratio 0.95`: Guarantees a ~115 MiB safety margin on GPU 0 during extreme multi-chunk prefill (up to 198,000 tokens), preventing OOM on primary GPUs driving desktop displays.
 > - `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: Eliminates memory fragmentation spikes during long multi-chunk requests.
+> - `FREETOKEN_PREFILL_COPY_DEFER=prev_ar` and `FREETOKEN_MOE_AR_GROUP=2048`: keep expert H2D off the PCIe link while the MoE all-reduce runs, then hide each group's all-reduce under the next group's GEMM. On this box that is **64k prefill 1687 → 1852 tok/s**. Unset, both default off (`off` and `0`).
 
 `--mm-encoder-weights cpu` serves images with the vision tower on the CPU (see item 4 above); images are
 capped at 1024 tokens unless `--image-max-tokens` is given. For text-only serving, use `--text-model-only`

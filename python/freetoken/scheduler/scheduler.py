@@ -23,6 +23,7 @@ from freetoken.message import (
     UserMsg,
 )
 from freetoken.utils import (
+    div_ceil,
     init_logger,
     load_eos_token_ids,
     load_tokenizer,
@@ -148,6 +149,10 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # Requests whose prompt+generation does not fit the current KV pool. They are not in
+        # prefill_manager, so a short request can still run; the pool grows once the scheduler
+        # is idle. Every TP rank sees the same messages, so the list stays identical.
+        self._kv_wait: list[UserMsg] = []
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -248,6 +253,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or self._kv_wait  # an idle grow has to run; blocking here would wait for another request
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -259,6 +265,10 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._maybe_grow_kv()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -293,6 +303,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or self._kv_wait
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -304,6 +315,8 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        if not (self.prefill_manager.runnable or self.decode_manager.runnable):
+            self._maybe_grow_kv()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -611,11 +624,12 @@ class Scheduler(SchedulerIOMixin):
                     ]
                 )
                 return
-            input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
-            max_output_len = max_seq_len - input_len
+            input_len = len(msg.input_ids)
+            seq_limit = self._kv_seq_limit()
+            max_output_len = seq_limit - input_len
             if max_output_len <= 0:
                 logger.warning_rank0(
-                    f"Input sequence length {input_len} exceeds {max_seq_len}, "
+                    f"Input sequence length {input_len} exceeds {seq_limit}, "
                     f"request {msg.uid} is dropped."
                 )
                 # Tell the client instead of dropping silently — otherwise its wait_for_ack
@@ -627,7 +641,7 @@ class Scheduler(SchedulerIOMixin):
                             # "prompt is too long: N tokens > M" is the phrasing Claude Code and
                             # OpenClaw match on; the Anthropic wire has no error code to read.
                             error=(
-                                f"prompt is too long: {input_len} tokens > {max_seq_len} maximum "
+                                f"prompt is too long: {input_len} tokens > {seq_limit} maximum "
                                 f"(prompt + generation); shorten the prompt or increase the KV "
                                 f"cache budget"
                             ),
@@ -642,9 +656,21 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            ek = getattr(self.engine, "elastic_kv", None)
+            if ek is not None:
+                need = self._aligned_kv_need(input_len, msg.sampling_params.max_tokens, ek.page_size)
+                current = self.engine.num_pages * ek.page_size
+                if need > current:
+                    self._kv_wait.append(msg)
+                    logger.info_rank0(
+                        f"elastic KV: holding request {msg.uid} "
+                        f"({need} tokens > pool {current}, max {ek.max_tokens})"
+                    )
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            self._kv_wait = [waiting for waiting in self._kv_wait if waiting.uid != msg.uid]
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
@@ -762,6 +788,87 @@ class Scheduler(SchedulerIOMixin):
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
                     error=error,
+                )
+            ]
+        )
+
+    def _kv_seq_limit(self) -> int:
+        """Admission ceiling: the elastic max when it is configured, otherwise the live pool."""
+        ek = getattr(self.engine, "elastic_kv", None)
+        if ek is None:
+            return self.engine.max_seq_len
+        return ek.max_tokens
+
+    @staticmethod
+    def _aligned_kv_need(input_len: int, max_tokens: int, page_size: int) -> int:
+        return div_ceil(input_len + max_tokens, page_size) * page_size
+
+    def _maybe_grow_kv(self) -> None:
+        """When idle, grow the KV pool to cover the parked requests and shrink the MoE cache.
+
+        Every rank runs this on the same parked list, then ``rebuild_cache`` barriers, so TP
+        stays in lockstep. Requests that fit the current pool were never parked, so they are
+        not stuck behind a longer one.
+        """
+        from freetoken.engine.cache_budget import elastic_grow_tokens
+
+        ek = getattr(self.engine, "elastic_kv", None)
+        if ek is None or not self._kv_wait:
+            return
+        if self.prefill_manager.runnable or self.decode_manager.runnable:
+            return
+        needs = [
+            self._aligned_kv_need(len(msg.input_ids), msg.sampling_params.max_tokens, ek.page_size)
+            for msg in self._kv_wait
+        ]
+        current = self.engine.num_pages * ek.page_size
+        target = elastic_grow_tokens(current, needs, ek.max_tokens)
+        if target is not None:
+            try:
+                moe, pages, _overlap = ek.plan(target)
+            except ValueError as exc:
+                logger.error(f"elastic KV grow rejected: {exc}")
+                msg = self._kv_wait.pop(0)
+                self._reject_context(msg, ek.max_tokens)
+                return
+            logger.info_rank0(
+                f"elastic KV: growing pool {current} -> {pages * ek.page_size} tokens, "
+                f"MoE slots -> {moe}"
+            )
+            self.rebuild_cache(moe_cache_size=moe, num_pages=pages)
+            current = self.engine.num_pages * ek.page_size
+        self._admit_kv_wait(current, ek.max_tokens, ek.page_size)
+
+    def _admit_kv_wait(self, capacity: int, kv_max: int, page_size: int) -> None:
+        kept: list[UserMsg] = []
+        reserved = 0
+        for msg in self._kv_wait:
+            need = self._aligned_kv_need(len(msg.input_ids), msg.sampling_params.max_tokens, page_size)
+            if need > kv_max:
+                self._reject_context(msg, kv_max)
+                continue
+            if reserved + need <= capacity:
+                self.prefill_manager.add_one_req(msg)
+                reserved += need
+            else:
+                kept.append(msg)
+        self._kv_wait = kept
+
+    def _reject_context(self, msg: UserMsg, limit: int) -> None:
+        input_len = len(msg.input_ids)
+        logger.warning_rank0(
+            f"Input sequence length {input_len} exceeds {limit}, request {msg.uid} is dropped."
+        )
+        self.send_result(
+            [
+                ErrorReplyMsg(
+                    uid=msg.uid,
+                    error=(
+                        f"prompt is too long: {input_len} tokens > {limit} maximum "
+                        f"(prompt + generation); shorten the prompt or increase the KV "
+                        f"cache budget"
+                    ),
+                    code="context_length_exceeded",
                 )
             ]
         )

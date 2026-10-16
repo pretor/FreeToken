@@ -6,6 +6,7 @@ measured quantities, so it is unit-testable without a device.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from freetoken.utils import div_ceil
@@ -138,3 +139,104 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+
+
+def plan_elastic_kv(
+    *,
+    budget_bytes: int,
+    per_expert_bytes: int,
+    cache_per_page: int,
+    page_size: int,
+    kv_tokens: int,
+    num_experts: int,
+    total_experts: int,
+    prefill_overlap: bool,
+    max_slots: int,
+    moe_floor: int,
+) -> tuple[int, int, bool]:
+    """Pin the KV pool to ``kv_tokens`` (rounded up to a page) and give the rest of the budget to MoE.
+
+    Leftover bytes stay unused, so the pool is the requested size rather than "whatever remains
+    after experts". Raises ``ValueError`` when that KV pin plus ``moe_floor`` does not fit.
+    ``prefill_overlap`` stays on only while the resulting slot count can hold two expert layers.
+    """
+    assert per_expert_bytes > 0 and cache_per_page > 0 and page_size > 0
+    hi = min(total_experts, max_slots)
+    if moe_floor > hi:
+        raise ValueError(f"MoE floor {moe_floor} slots exceeds the slot cap {hi}")
+    pages = max(2, div_ceil(kv_tokens, page_size))
+    kv_bytes = pages * cache_per_page
+    raw = (budget_bytes - kv_bytes) // per_expert_bytes
+    if raw < moe_floor:
+        raise ValueError(
+            f"elastic KV of {pages * page_size} tokens leaves {raw} expert slots, "
+            f"below the floor of {moe_floor}"
+        )
+    moe_cache_size = min(raw, hi)
+    overlap = prefill_overlap and moe_cache_size >= 2 * num_experts
+    assert moe_cache_size * per_expert_bytes + kv_bytes <= budget_bytes
+    return moe_cache_size, pages, overlap
+
+
+def max_elastic_tokens(
+    *,
+    budget_bytes: int,
+    per_expert_bytes: int,
+    cache_per_page: int,
+    page_size: int,
+    moe_floor: int,
+) -> int:
+    """Largest page-aligned KV token count that still leaves ``moe_floor`` expert slots."""
+    room = budget_bytes - moe_floor * per_expert_bytes
+    if room < 2 * cache_per_page:
+        return 0
+    return (room // cache_per_page) * page_size
+
+
+def elastic_grow_tokens(current_tokens: int, needs: list[int], kv_max: int) -> int | None:
+    """Pool size that covers the longest prefix of ``needs`` that fits under ``kv_max``.
+
+    Needs above ``kv_max`` are skipped (the caller rejects them). Returns ``None`` when the
+    current pool already covers that prefix, so a second request can wait without a rebuild.
+    """
+    acc = 0
+    for need in needs:
+        if need > kv_max:
+            continue
+        if acc + need > kv_max:
+            break
+        acc += need
+    if acc <= current_tokens:
+        return None
+    return acc
+
+
+@dataclass(frozen=True)
+class ElasticKv:
+    """Startup budget shared by every TP rank, so a grow replans without re-reading GPU memory."""
+
+    budget_bytes: int
+    per_expert_bytes: int
+    cache_per_page: int
+    page_size: int
+    num_experts: int
+    total_experts: int
+    max_slots: int
+    prefill_overlap: bool
+    moe_floor: int
+    initial_tokens: int
+    max_tokens: int
+
+    def plan(self, kv_tokens: int) -> tuple[int, int, bool]:
+        return plan_elastic_kv(
+            budget_bytes=self.budget_bytes,
+            per_expert_bytes=self.per_expert_bytes,
+            cache_per_page=self.cache_per_page,
+            page_size=self.page_size,
+            kv_tokens=kv_tokens,
+            num_experts=self.num_experts,
+            total_experts=self.total_experts,
+            prefill_overlap=self.prefill_overlap,
+            max_slots=self.max_slots,
+            moe_floor=self.moe_floor,
+        )

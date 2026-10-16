@@ -473,6 +473,7 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
+        self.elastic_kv = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table, the --embed-device cpu table above): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
@@ -483,6 +484,11 @@ class Engine:
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+        if (config.kv_initial_tokens is not None or config.kv_max_tokens is not None) and self.elastic_kv is None:
+            raise RuntimeError(
+                "--kv-initial-tokens and --kv-max-tokens require an offload MoE strategy "
+                "(--moe-strategy offload, hybrid, or cpu)"
+            )
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -741,6 +747,108 @@ class Engine:
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
 
+    def _configure_elastic_kv(self, config: EngineConfig, banks, size_cap: int) -> None:
+        """Start the KV pool at --kv-initial-tokens and remember how to grow it to --kv-max-tokens.
+
+        The MoE slot count is whatever of ``size_cap`` still fits beside that KV pin. Later growth
+        replans from the same byte budget (cross-rank min), so every TP rank computes the same
+        geometry. ``--num-tokens`` / ``--moe-cache-size`` do not pin the pool once this is on.
+        """
+        from freetoken.engine.cache_budget import (
+            ElasticKv,
+            expert_bytes_per_slot,
+            max_elastic_tokens,
+            net_cache_budget_bytes,
+            plan_elastic_kv,
+        )
+        from freetoken.utils import div_ceil
+
+        initial = config.kv_initial_tokens
+        requested_max = config.kv_max_tokens
+        if initial is None or requested_max is None:
+            raise ValueError("elastic KV needs both --kv-initial-tokens and --kv-max-tokens")
+        if initial <= 0 or requested_max <= 0:
+            raise ValueError(
+                f"elastic KV sizes must be positive, got initial={initial} max={requested_max}"
+            )
+        if initial > requested_max:
+            raise ValueError(
+                f"--kv-initial-tokens {initial} is above --kv-max-tokens {requested_max}"
+            )
+
+        cache_per_page, fixed_cache_size, page_tokens, _min_reserve = self._pool_cls.kv_cost(config)
+        fixed_cache_size += state_pool_bytes(config)
+        per_expert = expert_bytes_per_slot(banks.sources)
+        num_experts = config.model_config.num_experts
+        total_experts = config.model_config.num_moe_layers * num_experts
+        budget = net_cache_budget_bytes(
+            config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+        )
+        max_slots = min(size_cap, total_experts)
+        # Rebuild refuses a slot count below the per-pool decode floor (top-k * max running).
+        decode_batch = max(config.max_running_req, 1)
+        pool_floor = sum(p.min_num_slots for p in self._moe_pools(decode_batch))
+        overlap_floor = 2 * num_experts if config.moe_prefill_overlap and max_slots >= 2 * num_experts else num_experts
+        moe_floor = max(pool_floor, overlap_floor)
+        fit = max_elastic_tokens(
+            budget_bytes=budget,
+            per_expert_bytes=per_expert,
+            cache_per_page=cache_per_page,
+            page_size=page_tokens,
+            moe_floor=moe_floor,
+        )
+        ceiling = min(requested_max, config.max_seq_len, fit)
+        ceiling = (ceiling // page_tokens) * page_tokens
+        initial_aligned = div_ceil(initial, page_tokens) * page_tokens
+        if ceiling < page_tokens * 2 or initial_aligned > ceiling:
+            raise ValueError(
+                f"elastic KV cannot place {initial_aligned} initial tokens under a ceiling of "
+                f"{ceiling} (requested max {requested_max}, checkpoint/override {config.max_seq_len}, "
+                f"budget fits {fit} tokens with {moe_floor} expert slots kept)"
+            )
+        if ceiling != requested_max:
+            logger.info_rank0(
+                f"elastic KV max clamped from {requested_max} to {ceiling} tokens "
+                f"(checkpoint/override {config.max_seq_len}, budget fits {fit})"
+            )
+        moe, pages, overlap = plan_elastic_kv(
+            budget_bytes=budget,
+            per_expert_bytes=per_expert,
+            cache_per_page=cache_per_page,
+            page_size=page_tokens,
+            kv_tokens=initial_aligned,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            prefill_overlap=config.moe_prefill_overlap,
+            max_slots=max_slots,
+            moe_floor=moe_floor,
+        )
+        if config.num_page_override not in (None, pages) or config.moe_cache_size not in (0, moe):
+            logger.info_rank0(
+                "elastic KV replaces the fixed MoE/KV sizes "
+                f"(moe_cache_size={config.moe_cache_size}, num_page_override={config.num_page_override})"
+            )
+        object.__setattr__(config, "moe_cache_size", moe)
+        object.__setattr__(config, "moe_prefill_overlap", overlap)
+        object.__setattr__(config, "num_page_override", pages)
+        self.elastic_kv = ElasticKv(
+            budget_bytes=budget,
+            per_expert_bytes=per_expert,
+            cache_per_page=cache_per_page,
+            page_size=page_tokens,
+            num_experts=num_experts,
+            total_experts=total_experts,
+            max_slots=max_slots,
+            prefill_overlap=config.moe_prefill_overlap,
+            moe_floor=moe_floor,
+            initial_tokens=pages * page_tokens,
+            max_tokens=ceiling,
+        )
+        logger.info_rank0(
+            f"elastic KV: start {self.elastic_kv.initial_tokens} tokens, "
+            f"max {ceiling}, MoE slots {moe} (floor {moe_floor})"
+        )
+
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -858,7 +966,9 @@ class Engine:
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
         pools = self._moe_pools(1)
         size_cap = sum(p.max_num_slots for p in pools)
-        if config.moe_cache_auto:
+        if config.kv_initial_tokens is not None or config.kv_max_tokens is not None:
+            self._configure_elastic_kv(config, banks, size_cap)
+        elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)

@@ -875,6 +875,27 @@ def parse_args(
         default=ServerArgs.kv_reserve_tokens,
         help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
     )
+    parser.add_argument(
+        "--kv-initial-tokens",
+        type=int,
+        default=ServerArgs.kv_initial_tokens,
+        help=(
+            "KV tokens occupied at startup. Requires --kv-max-tokens. The rest of the VRAM "
+            "budget goes to GPU expert slots; the pool grows later by shrinking that cache."
+        ),
+    )
+    parser.add_argument(
+        "--kv-max-tokens",
+        type=int,
+        default=ServerArgs.kv_max_tokens,
+        help=(
+            "Ceiling the KV pool may grow to when a queued request needs more context than the "
+            "current pool. Growth runs only while the scheduler is idle, on every TP rank, and "
+            "shrinks the MoE slot cache so both stay inside the startup VRAM budget. Capped by "
+            "the checkpoint context and --max-seq-len-override. Several requests share one grow: "
+            "the pool covers as many waiting reservations as fit under this ceiling."
+        ),
+    )
 
     parser.add_argument(
         "--moe-cache-scope",

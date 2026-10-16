@@ -55,6 +55,11 @@ class EngineConfig:
     # --moe-cache-split: how pools share the slots; equal or profile:<path> (by expert use from a profile file)
     moe_cache_split: str = "equal"
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Elastic KV (--kv-initial-tokens / --kv-max-tokens). Both must be set. The pool starts at
+    # the initial size; a request that needs more grows it up to the max while the scheduler is
+    # idle, and the GPU expert cache shrinks to stay inside the same VRAM budget.
+    kv_initial_tokens: int | None = None
+    kv_max_tokens: int | None = None
     moe_cache_policy: str = "lru"
     moe_prefill_demand_tokens: int = 0
     moe_prefill_overlap: bool = True

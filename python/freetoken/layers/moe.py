@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Iterator, Tuple
+from typing import TYPE_CHECKING, Iterator, NamedTuple, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -19,6 +19,21 @@ if TYPE_CHECKING:
 # is computed outside the MoE layer. Such models call ``routed_forward`` with a
 # precomputed routing instead of going through the generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
+
+
+class PrefillBind(NamedTuple):
+    """Weight views + routing for one offload prefill call; GEMM is a separate step.
+
+    ``release`` is True when the caller must ``release_prefill_layer`` after the last GEMM
+    (not after the first group of a split all-reduce).
+    """
+
+    topk_weights: torch.Tensor
+    topk_ids: torch.Tensor
+    views: tuple[torch.Tensor, ...]
+    n: int | None
+    alphas: tuple[torch.Tensor, torch.Tensor] | None
+    release: bool
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
@@ -188,6 +203,12 @@ class OffloadMoELayer(MoELayer):
     def skips_inactive_slots(self) -> bool:
         return self.quant_method.kernel.supports_inactive_slots
 
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        out = super()._maybe_all_reduce(hidden_states)
+        if self.offload_cache is not None and get_global_ctx().batch.is_prefill:
+            self.offload_cache.mark_layer_reduced(self.layer_id)
+        return out
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -248,6 +269,25 @@ class OffloadMoELayer(MoELayer):
             renormalize=self.renormalize,
         )
         return self._prefill_routed(hidden_states, topk_weights, topk_ids)
+
+    def prefill_bind(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None = None,
+    ) -> PrefillBind:
+        """Routing + resident expert views for a prefill call, without the GEMM.
+
+        Used when the caller splits the GEMM + MoE all-reduce into token groups so the
+        next group's GEMM can overlap the previous group's all-reduce. ``release`` is
+        still the caller's job after the last GEMM.
+        """
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        return self._prefill_bind(hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
@@ -354,11 +394,35 @@ class OffloadMoELayer(MoELayer):
         longer one streams whole layers -- double-buffered behind the previous layer's GEMMs
         when ``prefill_overlap`` is on, else a synchronous ``materialize_layer`` -- where
         position == expert id, so the routing ids pass through unmapped."""
+        cache = self.offload_cache
+        assert cache is not None
+        bind = self._prefill_bind(hidden_states, topk_weights, topk_ids)
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            bind.topk_weights,
+            bind.topk_ids,
+            views=bind.views,
+            n=bind.n,
+            alphas=bind.alphas,
+            is_prefill=True,
+        )
+        if bind.release:
+            cache.release_prefill_layer(self.layer_id)
+        return out
+
+    def _prefill_bind(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> PrefillBind:
         from freetoken import core
 
         batch = core._GLOBAL_CTX.batch if core._GLOBAL_CTX is not None else None
         cache = self.offload_cache
         assert cache is not None
+        release = not getattr(batch, "defer_release_prefill", False)
         if cache.loads_prefill_on_demand(hidden_states.shape[0]) and not getattr(batch, "skip_begin_prefill", False):
             slots = cache.load_prefill_experts(self.layer_id, topk_ids)
             unique_slots, compact_ids = torch.unique(slots, return_inverse=True)
@@ -368,46 +432,19 @@ class OffloadMoELayer(MoELayer):
             alphas = cache.alphas_for_slots(self.layer_id)
             if alphas is not None:
                 alphas = (alphas[0][unique_slots], alphas[1][unique_slots])
-            return self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                compact_ids,
-                views=active_views,
-                n=u,
-                alphas=alphas,
-                is_prefill=True,
-            )
+            return PrefillBind(topk_weights, compact_ids, active_views, u, alphas, release=False)
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
-            out = self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=views,
-                n=self.num_experts,
-                alphas=cache.alphas_for_layer(self.layer_id),
-                is_prefill=True,
+            return PrefillBind(
+                topk_weights, topk_ids, views, self.num_experts,
+                cache.alphas_for_layer(self.layer_id), release,
             )
-            if not getattr(batch, "defer_release_prefill", False):
-                cache.release_prefill_layer(self.layer_id)
-            return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
-        out = self._expert_gemm(
-            cache,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            views=cache.stage_views(self.layer_id, 0),
-            n=self.num_experts,
-            alphas=cache.alphas_for_layer(self.layer_id),
-            is_prefill=True,
+        return PrefillBind(
+            topk_weights, topk_ids, cache.stage_views(self.layer_id, 0),
+            self.num_experts, cache.alphas_for_layer(self.layer_id), release,
         )
-        if not getattr(batch, "defer_release_prefill", False):
-            cache.release_prefill_layer(self.layer_id)
-        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

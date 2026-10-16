@@ -25,6 +25,13 @@ _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0"
 # entry the batch sees is >= this size.
 _SMALL_BANK_FEAT_BYTES = 256 * 1024
 
+# Without P2P a TP all-reduce crosses the same PCIe links as the prefill expert copies, and
+# the two slow each other down (4x 5060 Ti, gen3 x8: AR +39 %, H2D +35 %). "prev_ar" starts a
+# buffer's next copy after the MoE all-reduce of the layer that released it instead of after
+# that layer's GEMMs (64k prefill +6.4 %, 4k/16k unchanged); "off" keeps the copy at release.
+_COPY_DEFER = os.getenv("FREETOKEN_PREFILL_COPY_DEFER", "off").strip().lower()
+assert _COPY_DEFER in ("off", "prev_ar"), f"FREETOKEN_PREFILL_COPY_DEFER={_COPY_DEFER!r}"
+
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
@@ -316,6 +323,8 @@ class OffloadMoeCache:
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
+        # prev_ar: the layer whose release of buffer b waits for its all-reduce to be recorded
+        self._release_pending: list[int | None] = [None, None]
         # hit-D2D split state: pinned begin-of-chunk snapshot of slot_for_id (the
         # classification input; frozen for the chunk -- no decode runs inside one,
         # and buffer invalidation only clears slots under the staging buffers, which classify as
@@ -684,6 +693,7 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
+        self._release_pending = [None, None]
         # 2. Drop old GPU tensors (free-before-alloc).
         self.banks = []
         self.bank_caches = {}
@@ -879,6 +889,7 @@ class OffloadMoeCache:
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
+        self._release_pending = [None, None]
         # the double buffers are the staging views (_slice_pools), on top of the first pools' slots
         if self.device.type == "cuda":
             self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
@@ -926,6 +937,8 @@ class OffloadMoeCache:
         self._chunk_total_rows = 0
         if not self.prefill_overlap:
             return
+        for b in range(2):
+            self._flush_pending_release(b)
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
         if self.prefill_copy_stream is not None:
@@ -967,6 +980,7 @@ class OffloadMoeCache:
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, buffer_id)):
                 view.copy_(per_layer[layer_id], non_blocking=True)
 
+        self._flush_pending_release(buffer_id)
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
@@ -1138,11 +1152,32 @@ class OffloadMoeCache:
         if self._prefill_buffer_layer[buffer_id] != layer_id:
             return
         if self.prefill_release_events:
-            self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
+            if _COPY_DEFER == "prev_ar":
+                self._release_pending[buffer_id] = layer_id
+            else:
+                self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
         if layer_id == self.num_layers - 1:
             self._prefill_buffer_layer = [None, None]
+
+    def _flush_pending_release(self, buffer_id: int) -> None:
+        """Record a deferred release whose all-reduce never reported (tp 1, or a model without
+        the hook) at the current compute-stream position, which is past the releasing GEMMs."""
+        if self._release_pending[buffer_id] is not None:
+            self.prefill_release_events[buffer_id].record(torch.cuda.current_stream(self.device))
+            self._release_pending[buffer_id] = None
+
+    def mark_layer_reduced(self, layer_id: int) -> None:
+        """``layer_id``'s MoE all-reduce is enqueued on the compute stream: under
+        ``FREETOKEN_PREFILL_COPY_DEFER=prev_ar`` the buffer it released may be refilled from here."""
+        if _COPY_DEFER == "off" or not self.prefill_overlap or not self.prefill_release_events:
+            return
+        stream = torch.cuda.current_stream(self.device)
+        for b in range(2):
+            if self._release_pending[b] == layer_id:
+                self.prefill_release_events[b].record(stream)
+                self._release_pending[b] = None
 
     def loads_prefill_on_demand(self, num_tokens: int) -> bool:
         return 0 < num_tokens <= self.prefill_demand_tokens

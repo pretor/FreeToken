@@ -784,6 +784,18 @@ class Engine:
         budget = net_cache_budget_bytes(
             config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
         )
+        # Leave about 900 MiB free per 16 GiB card once the process is resident.
+        # 224 MiB of reserve captured graphs at 0.86 GiB and settled near 720 MiB;
+        # 400 MiB of reserve puts the idle free memory on the 900 MiB mark.
+        activation_reserve = 400 * 1024 * 1024
+        if budget <= activation_reserve:
+            raise ValueError(
+                f"elastic KV budget {budget} B is below the {activation_reserve} B activation reserve"
+            )
+        budget -= activation_reserve
+        logger.info_rank0(
+            f"elastic KV budget holds back {activation_reserve / 2**30:.1f} GiB for graphs and prefill"
+        )
         max_slots = min(size_cap, total_experts)
         # Rebuild refuses a slot count below the per-pool decode floor (top-k * max running).
         decode_batch = max(config.max_running_req, 1)
@@ -823,6 +835,56 @@ class Engine:
             max_slots=max_slots,
             moe_floor=moe_floor,
         )
+        # per_expert_bytes is a mean. Per-layer pools are wider than that mean, so the
+        # planned slot count can exceed the budget and leave no room for the prefill activation.
+        kv_bytes = pages * cache_per_page
+        fit_pools = self._moe_pools(decode_batch)
+        lo, hi = moe_floor, moe
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            try:
+                sizes = split_slots(mid, fit_pools, self._moe_expert_counts)
+            except ValueError:
+                lo = mid + 1
+                continue
+            if self._moe_pool_bytes(sizes) + kv_bytes <= budget:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is None:
+            raise ValueError(
+                f"elastic KV of {pages * page_tokens} tokens does not fit beside {moe_floor} expert slots"
+            )
+        if best != moe:
+            logger.info_rank0(
+                f"elastic KV: MoE slots {moe} -> {best} so the per-layer pools stay inside the VRAM budget"
+            )
+        moe = best
+        pinned = config.moe_cache_size
+        if pinned > 0:
+            if pinned < moe_floor:
+                raise ValueError(
+                    f"--moe-cache-size {pinned} is below the elastic floor of {moe_floor} slots"
+                )
+            pinned_bytes = self._moe_pool_bytes(
+                split_slots(pinned, fit_pools, self._moe_expert_counts)
+            )
+            if pinned_bytes + kv_bytes > budget + activation_reserve:
+                raise ValueError(
+                    f"--moe-cache-size {pinned} does not fit beside {pages * page_tokens} KV tokens"
+                )
+            if pinned != best:
+                logger.info_rank0(
+                    f"elastic KV: pinned MoE slots {pinned} (budget would allow {best})"
+                )
+            moe = pinned
+        overlap = bool(config.moe_prefill_overlap and moe >= 2 * num_experts)
+        actual = self._moe_pool_bytes(split_slots(moe, fit_pools, self._moe_expert_counts))
+        # Later grows replan from one byte rate. Use the real pool cost so they cannot
+        # exceed the budget the way the layer-mean estimate does.
+        per_expert = max(per_expert, (actual + moe - 1) // moe)
         if config.num_page_override not in (None, pages) or config.moe_cache_size not in (0, moe):
             logger.info_rank0(
                 "elastic KV replaces the fixed MoE/KV sizes "
@@ -831,6 +893,8 @@ class Engine:
         object.__setattr__(config, "moe_cache_size", moe)
         object.__setattr__(config, "moe_prefill_overlap", overlap)
         object.__setattr__(config, "num_page_override", pages)
+        qwen4 = getattr(config.model_config, "qwen4_args", None)
+        activation_width = int(qwen4.hc_count * qwen4.hidden_size) if qwen4 is not None else 0
         self.elastic_kv = ElasticKv(
             budget_bytes=budget,
             per_expert_bytes=per_expert,
@@ -843,6 +907,7 @@ class Engine:
             moe_floor=moe_floor,
             initial_tokens=pages * page_tokens,
             max_tokens=ceiling,
+            activation_width=activation_width,
         )
         logger.info_rank0(
             f"elastic KV: start {self.elastic_kv.initial_tokens} tokens, "

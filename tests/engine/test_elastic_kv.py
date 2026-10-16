@@ -93,6 +93,31 @@ def test_elastic_state_replans_the_same_budget():
     assert grown_pages * ek.page_size == ek.max_tokens
 
 
+def test_grow_pays_for_kv_pages_only():
+    pe = 1024 * 1024
+    ek = ElasticKv(
+        budget_bytes=2000 * pe,
+        per_expert_bytes=pe,
+        cache_per_page=pe,
+        page_size=64,
+        num_experts=4,
+        total_experts=5_000,
+        max_slots=5_000,
+        prefill_overlap=True,
+        moe_floor=8,
+        initial_tokens=32_768,
+        max_tokens=262_144,
+    )
+    short, _, _ = ek.plan(32_768, activation_tokens=32_768)
+    short_kv, _, _ = ek.plan(32_768)
+    long, _, _ = ek.plan(65_536, activation_tokens=65_536)
+    long_kv, _, _ = ek.plan(65_536)
+    # Fixed scratch, not a per-token residual: 64k gives up the same extra slots as 32k.
+    assert short_kv - short == 384
+    assert long_kv - long == 384
+    assert long < short
+
+
 def test_grow_covers_several_requests_until_the_ceiling():
     # 40k + 40k fits under 100k; the pool grows once to their sum.
     assert elastic_grow_tokens(32_000, [40_000, 40_000], 100_000) == 80_000

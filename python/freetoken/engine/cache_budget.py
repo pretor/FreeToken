@@ -141,6 +141,22 @@ def resolve_moe_cache_auto(
     )
 
 
+# A KV/MoE byte swap at 16450 slots left a 64k prefill ~100 MiB short of the layer-major
+# tail. This fixed scratch is that gap, with margin. It does not grow with the prompt:
+# 14500 slots plus a 200k KV pool already served long prefill.
+PREFILL_HEADROOM_BYTES = 384 * 1024 * 1024
+
+
+def prefill_scratch_bytes(prompt_tokens: int) -> int:
+    """Bytes held back from the expert cache on a grow, so the prefill still fits.
+
+    Same amount at 64k and at 250k. The KV pages themselves pay for the longer context.
+    """
+    if prompt_tokens <= 0:
+        return 0
+    return PREFILL_HEADROOM_BYTES
+
+
 def plan_elastic_kv(
     *,
     budget_bytes: int,
@@ -153,6 +169,7 @@ def plan_elastic_kv(
     prefill_overlap: bool,
     max_slots: int,
     moe_floor: int,
+    activation_bytes: int = 0,
 ) -> tuple[int, int, bool]:
     """Pin the KV pool to ``kv_tokens`` (rounded up to a page) and give the rest of the budget to MoE.
 
@@ -166,7 +183,8 @@ def plan_elastic_kv(
         raise ValueError(f"MoE floor {moe_floor} slots exceeds the slot cap {hi}")
     pages = max(2, div_ceil(kv_tokens, page_size))
     kv_bytes = pages * cache_per_page
-    raw = (budget_bytes - kv_bytes) // per_expert_bytes
+    hold = max(0, activation_bytes)
+    raw = (budget_bytes - kv_bytes - hold) // per_expert_bytes
     if raw < moe_floor:
         raise ValueError(
             f"elastic KV of {pages * page_size} tokens leaves {raw} expert slots, "
@@ -174,7 +192,7 @@ def plan_elastic_kv(
         )
     moe_cache_size = min(raw, hi)
     overlap = prefill_overlap and moe_cache_size >= 2 * num_experts
-    assert moe_cache_size * per_expert_bytes + kv_bytes <= budget_bytes
+    assert moe_cache_size * per_expert_bytes + kv_bytes + hold <= budget_bytes
     return moe_cache_size, pages, overlap
 
 
@@ -226,8 +244,13 @@ class ElasticKv:
     moe_floor: int
     initial_tokens: int
     max_tokens: int
+    # Kept so a restart still accepts state built with the old field. The grow no longer
+    # bills ``tokens * width``; see ``prefill_scratch_bytes``.
+    activation_width: int = 0
+    activation_dtype_bytes: int = 2
 
-    def plan(self, kv_tokens: int) -> tuple[int, int, bool]:
+    def plan(self, kv_tokens: int, *, activation_tokens: int = 0) -> tuple[int, int, bool]:
+        hold = prefill_scratch_bytes(activation_tokens)
         return plan_elastic_kv(
             budget_bytes=self.budget_bytes,
             per_expert_bytes=self.per_expert_bytes,
@@ -239,4 +262,5 @@ class ElasticKv:
             prefill_overlap=self.prefill_overlap,
             max_slots=self.max_slots,
             moe_floor=self.moe_floor,
+            activation_bytes=hold,
         )

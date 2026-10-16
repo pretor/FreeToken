@@ -824,8 +824,11 @@ class Scheduler(SchedulerIOMixin):
         current = self.engine.num_pages * ek.page_size
         target = elastic_grow_tokens(current, needs, ek.max_tokens)
         if target is not None:
+            # Layer-major (<=32k) also keeps a fixed scratch reserve. Longer prompts only
+            # pay for the extra KV pages, which is how 14500 slots served a 200k pool.
+            activation_tokens = max(len(msg.input_ids) for msg in self._kv_wait)
             try:
-                moe, pages, _overlap = ek.plan(target)
+                moe, pages, _overlap = ek.plan(target, activation_tokens=activation_tokens)
             except ValueError as exc:
                 logger.error(f"elastic KV grow rejected: {exc}")
                 msg = self._kv_wait.pop(0)
@@ -833,9 +836,10 @@ class Scheduler(SchedulerIOMixin):
                 return
             logger.info_rank0(
                 f"elastic KV: growing pool {current} -> {pages * ek.page_size} tokens, "
-                f"MoE slots -> {moe}"
+                f"MoE slots -> {moe} (prompt {activation_tokens} tokens)"
             )
             self.rebuild_cache(moe_cache_size=moe, num_pages=pages)
+            torch.cuda.empty_cache()
             current = self.engine.num_pages * ek.page_size
         self._admit_kv_wait(current, ek.max_tokens, ek.page_size)
 

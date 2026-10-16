@@ -74,6 +74,24 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
    - **Measured and left out of the tree**: capy-flash cache policies (`lru_admit`, a frequency admission, and `fr`) on this per-layer cache (~302 of 512 experts resident, hit-D2D **54.8%**). Prefill and decode throughput did not move. Decode stayed ~60 tok/s with about 10–14 expert misses per token. A literal capy-style `ar` defer, recording the copy release at a different point than `prev_ar`, was slower than `prev_ar`.
    - **Tests**: `tests/moe/test_prefill_copy_defer.py`, `tests/moe/test_moe_ar_group.py`. Both paths stay off unless the env vars are set.
 
+8. **Elastic KV (`--kv-initial-tokens`, `--kv-max-tokens`)**:
+   - **What**: the KV pool starts small so the GPU expert cache can be large, then grows up to a configured ceiling when a request needs more context. Experts stay in host RAM (`--moe-strategy offload`). Growth only changes how many of them stay resident on the GPU. The scheduler does this while idle, on every TP rank, with more than one running request allowed. A request that fits the current pool is admitted immediately.
+   - **How to turn it on**: set both flags. `--kv-initial-tokens` is the pool occupied at startup. `--kv-max-tokens` is the ceiling (capped by the checkpoint context and `--max-seq-len-override`, so raise the override to the same value). `--moe-cache-size` is the startup slot pin. Omit either KV flag and the server keeps the fixed pool.
+   - **What a grow costs**: extra KV pages, plus a fixed 384 MiB scratch so the layer-major tail of a long prefill still fits. The scratch does not grow with the prompt. CUDA graphs are recaptured once per grow.
+   - **Measured on this ThinkStation** (Qwen3.8-Flash-Next NVFP4, TP=4, FP8 KV, layer-major, `prev_ar`, `FREETOKEN_MOE_AR_GROUP=2048`). 16450 slots is the largest cache that finishes a 32k prefill; 16550 OOMs. With `--kv-initial-tokens 40960` and `--kv-max-tokens 262144`:
+
+     | prompt | GPU expert slots | prefill |
+     | --- | --- | --- |
+     | 16k | 16450 | 1999 tok/s |
+     | 32k | 16450 | 2222 tok/s |
+     | 64k | 15781 | 1372 tok/s |
+     | 128k | 15121 | 1201 tok/s |
+     | 160k | 14791 | 1253 tok/s |
+     | 200k | 14378 | 1263 tok/s |
+     | 262k (model max) | 13802 | 1248 tok/s |
+
+   - **Tests**: `tests/engine/test_elastic_kv.py`.
+
 ---
 
 ### Tested & Verified Models:
@@ -102,9 +120,10 @@ ft checkpoint convert \
   --model local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
   --output /models/local-inference-lab-Qwen3.8-Flash-Next-NVFP4-FTW
 
-# 2. Launch FreeToken server (TP=4, 200k context, FP8 KV cache, 14,500 MoE cache slots, Layer-Major prefill, image input on CPU)
+# 2. Launch FreeToken server (TP=4, FP8 KV, elastic 41k→262k, 16,450 MoE slots, layer-major, image input on CPU)
 #    prev_ar keeps expert H2D off the wire until the MoE all-reduce is queued.
 #    MOE_AR_GROUP=2048 overlaps that all-reduce with the next token group's GEMM.
+#    kv-initial-tokens is the pool at startup; kv-max-tokens is the ceiling the pool may grow to.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export FREETOKEN_PREFILL_COPY_DEFER=prev_ar
 export FREETOKEN_MOE_AR_GROUP=2048
@@ -119,14 +138,16 @@ numactl --interleave=all ft serve \
   --expert-load serial \
   --embed-device cpu \
   --decode-interleave-every 4 \
-  --moe-cache-size 14500 \
+  --moe-cache-size 16450 \
   --memory-ratio 0.95 \
+  --moe-cache-scope per-layer \
   --moe-prefill-hit-d2d \
   --prefill-layer-major \
+  --moe-prefill-demand-tokens 512 \
   --kv-cache-dtype fp8 \
-  --num-tokens 200000 \
-  --max-seq-len-override 200000 \
-  --kv-reserve-tokens 200000 \
+  --kv-initial-tokens 40960 \
+  --kv-max-tokens 262144 \
+  --max-seq-len-override 262144 \
   --max-running-requests 2 \
   --cuda-graph-max-bs 2 \
   --max-extend-length 4096 \
@@ -148,9 +169,9 @@ curl http://localhost:8000/v1/chat/completions -H 'Content-Type: application/jso
 > [!TIP]
 > **Key Performance Settings for Long Contexts & Stability:**
 > - `--prefill-layer-major`: Reorders prefill so all chunks run through a layer before advancing, keeping MoE experts resident and accelerating long-context TTFT from ~1,400 tok/s up to **2,082 tok/s**.
-> - `--moe-cache-size 14500` with `--memory-ratio 0.95`: Guarantees a ~115 MiB safety margin on GPU 0 during extreme multi-chunk prefill (up to 198,000 tokens), preventing OOM on primary GPUs driving desktop displays.
+> - `--kv-initial-tokens 40960`, `--kv-max-tokens 262144`, and `--moe-cache-size 16450`: start with a 41k KV pool and 16450 GPU expert slots, and grow the pool up to the 262k model maximum. On this box that is the largest slot count that still finishes a 32k prefill; at 200k the cache settles near **14378** slots.
 > - `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: Eliminates memory fragmentation spikes during long multi-chunk requests.
-> - `FREETOKEN_PREFILL_COPY_DEFER=prev_ar` and `FREETOKEN_MOE_AR_GROUP=2048`: keep expert H2D off the PCIe link while the MoE all-reduce runs, then hide each group's all-reduce under the next group's GEMM. On this box that is **64k prefill 1687 → 1852 tok/s**. Unset, both default off (`off` and `0`).
+> - `FREETOKEN_PREFILL_COPY_DEFER=prev_ar` and `FREETOKEN_MOE_AR_GROUP=2048`: keep expert H2D off the PCIe link while the MoE all-reduce runs, then hide each group's all-reduce under the next group's GEMM. On this box that is **64k prefill 1687 → 1852 tok/s** before the elastic pool. Unset, both default off (`off` and `0`).
 
 `--mm-encoder-weights cpu` serves images with the vision tower on the CPU (see item 4 above); images are
 capped at 1024 tokens unless `--image-max-tokens` is given. For text-only serving, use `--text-model-only`

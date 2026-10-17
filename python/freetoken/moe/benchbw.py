@@ -63,7 +63,7 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 # Formats the CPU MoE C++ kernel can compute AND this bench can build banks for; anything
-# else is offload-only here. (The kernel also does q4_0, but this bench has no q4_0 banks.)
+# else is offload-only here.
 _CPU_MOE_FORMATS = frozenset({"bf16", "nvfp4", "mxfp4_triton", "ds_fp4", "fp8_block"})
 # Formats this bench can build synthetic (correctly-sized) banks for.
 _BUILDABLE_FORMATS = frozenset({"bf16", "nvfp4", "fp8_block", "mxfp4_triton", "ds_fp4"})
@@ -476,7 +476,7 @@ def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: in
         cache, top_k=wl.top_k, activation=wl.activation,
         apply_router_weight_on_input=False, num_threads=num_threads, max_tokens=1,
         device=torch.device("cuda"), swiglu_alpha=wl.swiglu_alpha,
-        swiglu_limit=wl.swiglu_limit, act_block=wl.act_block,
+        swiglu_limit=wl.swiglu_limit, layer_formats=[(fmt, {"act_block": wl.act_block} if wl.act_block is not None else {})] * cache.num_layers,
     )
 
 

@@ -142,13 +142,9 @@ class GgmlMoEKernel(MoEKernel):
 class GGUFMoEMethod(MoEMethod):
     candidates = (GgmlMoEKernel,)
 
-    @property
-    def cpu_format(self) -> str | None:
-        # the CPU executor reads Q4_0 experts in their GGUF rows and BF16 experts as its bf16 banks; other ggml types have no CPU kernel yet
+    def cpu_spec(self) -> tuple[str | None, dict[str, int]]:
         gate_up, down = expert_types(self.cfg)
-        names = {type_name(gate_up), type_name(down)}
-        if names == {"Q4_0"}:
-            return "q4_0"
-        if names == {"BF16"}:
-            return "bf16"
-        return self.kernel.cpu_format
+        # BF16 experts keep the executor's bf16 kernels, which use AVX512-BF16 where the CPU has it; ggml-cpu is built for AVX2 only
+        if float_dtype(gate_up) is torch.bfloat16 and float_dtype(down) is torch.bfloat16:
+            return "bf16", {}
+        return "gguf", {"gate_up_type": gate_up, "down_type": down}

@@ -145,7 +145,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
-        arch_aliases=("Qwen3VLMoeForConditionalGeneration",),  # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM"),  # Qwen3-VL-30B-A3B: same text tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -155,7 +155,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
-        arch_aliases=("Qwen3_5MoeForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -303,6 +303,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=1536,  # experts reuse the dense intermediate_size
         expert_formats=_NVFP4_FORMATS,
         aliases=("MiniMaxAI/MiniMax-M2.5",),
+        arch_aliases=("MiniMaxM2GGUFForCausalLM",),
     ),
     AotModel(
         # GQA block-sparse (BSA): the BSAKVCache stores K/V through store_cache
@@ -321,7 +322,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=3072,
         expert_formats=("nvfp4",),
         aliases=("MiniMaxAI/MiniMax-M3",),
-        arch_aliases=("MiniMaxM3SparseForCausalLM",),
+        arch_aliases=("MiniMaxM3SparseForCausalLM", "MiniMaxM3GGUFForCausalLM"),
     ),
     AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
@@ -351,7 +352,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
-        arch_aliases=("Qwen3_5ForCausalLM",),  # text-only release of the same tower
+        arch_aliases=("Qwen3_5ForCausalLM", "Qwen3_5GGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
@@ -372,25 +373,28 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=6656,
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
+        arch_aliases=("MuseGlimmerGGUFForCausalLM",),
     ),
     AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        arch_aliases=("LlamaGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen2-7B",
         architecture="Qwen2ForCausalLM",
         hidden_size=3584,
         kv_groups=((4, 128),),
+        arch_aliases=("Qwen2GGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3-8B",
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
-        arch_aliases=("Qwen3VLForConditionalGeneration",),  # Qwen3-VL-8B: same text tower
+        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM"),  # Qwen3-VL-8B: same text tower
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",

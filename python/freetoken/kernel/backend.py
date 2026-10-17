@@ -15,11 +15,12 @@ import torch
 
 
 def _importable(name: str) -> bool:
-    # find_spec normally returns None when a package is absent, but it can raise
-    # (broken parent package, or a meta_path finder that blocks the name); treat
-    # any failure as "not available" so callers cleanly fall back to triton.
+    # Attempt actual import to verify compiled C/CUDA extensions and ABI compatibility.
+    # Treat any failure as "not available" so callers cleanly fall back to triton.
     try:
-        return importlib.util.find_spec(name) is not None
+        import importlib
+        importlib.import_module(name)
+        return True
     except Exception:
         return False
 

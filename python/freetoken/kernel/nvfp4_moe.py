@@ -217,7 +217,7 @@ _PREFILL_TUNING = {
     ("pro", None): replace(_TUNING_RTX_PRO, tiles=_PREFILL_TILES_H100),
     ("geforce", (8, 6)): replace(_TUNING_GEFORCE, steps=(16, 100, _INF), **_GEFORCE_SCALE_WORDS),
     ("geforce", (8, 9)): replace(_TUNING_GEFORCE, **_SM89_DECODE, **_GEFORCE_SCALE_WORDS),
-    ("geforce", (12, 0)): _TUNING_GEFORCE,
+    ("geforce", (12, 0)): replace(_TUNING_GEFORCE, **_GEFORCE_SCALE_WORDS),
     ("geforce", None): replace(_TUNING_GEFORCE, tiles=_PREFILL_TILES_H100),
 }
 # steps while the Gluon kernel runs BLOCK_SIZE_M >= 64, from an RTX PRO 6000 sweep; classes without an entry keep the Triton steps

@@ -353,6 +353,13 @@ def _e2m1x2_bf16(v, s2, BLOCK_N: tl.constexpr, BLOCK_KB: tl.constexpr):
 
 
 @triton.jit
+
+def _e2m1_byte_f16_x2pow_neg14(packed):
+    lo = (((packed & 0x08) << 12) | ((packed & 0x07) << 9)).to(tl.uint16).to(tl.float16, bitcast=True)
+    hi = (((packed & 0x80) << 8) | ((packed & 0x70) << 5)).to(tl.uint16).to(tl.float16, bitcast=True)
+    return lo, hi
+
+
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8

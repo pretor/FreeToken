@@ -360,6 +360,7 @@ def _e2m1_byte_f16_x2pow_neg14(packed):
     return lo, hi
 
 
+@triton.jit
 def _prefill_nvfp4_moe_kernel(
     a_ptr,             # [M, K] activations
     packed_ptr,        # [S, N, K // 2] uint8

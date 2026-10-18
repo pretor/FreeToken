@@ -50,6 +50,12 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
    - Details: [CPU vision encoder](docs/cli.md#cpu-vision-encoder); benchmark: `benchmarks/bench_cpu_vision.py`.
 
 5. **Pre-Merged Cutting-Edge Upstream PRs**:
+   - **[PR #736](https://github.com/FlashML-org/FreeToken/pull/736)**: `perf(moe): prefill nvfp4 moe experts on nvfp4 activations on sm_120` — W4A4 MoE prefill Gluon kernels on SM_120 for checkpoints with static activation scales.
+   - **[PR #733](https://github.com/FlashML-org/FreeToken/pull/733)**: `perf(moe): speed up the nvfp4 moe prefill gemm on rtx gpus` — warp-specialized Gluon NVFP4 prefill GEMM for SM_120 with TMA and `mma.sync`.
+   - **[PR #734](https://github.com/FlashML-org/FreeToken/pull/734)**: `feat(moe): bench hybrid fetch fractions per moe layer kind` — per-layer-kind bandwidth benchmarking for hybrid offload.
+   - **[PR #729](https://github.com/FlashML-org/FreeToken/pull/729)**: `perf(kernel): split triton decode attention by context length and sm count` — splits decode attention across SMs for higher decode throughput.
+   - **[PR #726](https://github.com/FlashML-org/FreeToken/pull/726)**: `perf(attention): copy triton metadata without blocking the host` — asynchronous non-blocking Triton metadata transfer.
+   - **[PR #723](https://github.com/FlashML-org/FreeToken/pull/723)**: `perf(kernel): rewrite the triton nvfp4 moe prefill gemm` — rewritten Triton NVFP4 MoE prefill GEMM optimized for GeForce RTX GPUs.
    - **[PR #635](https://github.com/FlashML-org/FreeToken/pull/635)**: `perf(moe): avoid intra-op fanout while filling NVFP4 host banks` — eliminates intra-op fanout latency when populating host-side NVFP4 expert banks.
    - **[PR #636](https://github.com/FlashML-org/FreeToken/pull/636)**: `feat(quant): opt-in fp8-block QAT for the lm_head` — enables FP8-block quantized LM heads to conserve GPU memory.
    - **[PR #639](https://github.com/FlashML-org/FreeToken/pull/639)**: `feat(server): add --api-key authentication` — adds `--api-key` and `$FREETOKEN_API_KEY` bearer authentication to protect the server endpoint.
@@ -91,6 +97,20 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
      | 262k (model max) | 13802 | 1248 tok/s |
 
    - **Tests**: `tests/engine/test_elastic_kv.py`.
+
+9. **Blackwell SM_120 Gluon Kernels & W4A4 MoE Acceleration (PR #733 & PR #736)**:
+   - **Upstream PR #733 & PR #736 Integration**: Merged warp-specialized **Gluon NVFP4 MoE kernels** specifically targeting Blackwell SM_120 (GeForce RTX 50 series), alongside PR #736's **W4A4 MoE prefill** path.
+   - **Multi-GPU TP Sharding Integration**: Adapted PR #736's static activation scale (`_input`) ingestion in `nvfp4_banks.py` to seamlessly operate alongside Tensor Parallelism (`tp_size=4`), correctly bypassing intermediate dimension slicing on activation scale scalars.
+   - **Split Decode Attention (PR #729)**: Integrated context-length and SM-count aware attention splitting across SMs.
+   - **Robust ABI Import Safety (`freetoken/kernel/backend.py`)**: Enhanced `_importable` to dynamically verify C/CUDA ABI compatibility (e.g. `sgl_kernel` / `torch` 2.14.x) preventing silent runtime symbol crashes and seamlessly falling back to Triton.
+   - **Production Benchmark Results on 4x RTX 5060 Ti TP=4 (Qwen3.8-Flash-Next-NVFP4-QAD)**:
+     - **50 Tokens Prefill / 50 Decode**: TTFT **0.222 s (222 ms)**, Decode **70.15 tok/s**, Total: **0.92 s**
+     - **1k Prefill / 200 Decode**: TTFT **1.767 s**, Decode **67.67 tok/s**, Total: **4.71 s**
+     - **4k Prefill / 200 Decode**: TTFT **2.452 s**, Prefill: **1,707.16 tok/s**, Decode: **65.15 tok/s**, Total: **5.51 s**
+     - **8k Prefill / 200 Decode**: TTFT **3.889 s**, Prefill: **2,130.10 tok/s**, Decode: **64.10 tok/s**, Total: **6.99 s**
+     - **16k Prefill / 500 Decode (3x Verified Avg)**: TTFT **7.20 s**, Prefill: **2,287.34 tok/s**, Decode: **65.26 tok/s**, Total: **14.85 s**
+     - **32k Prefill / 2,000 Decode**: TTFT **18.30 s**, Prefill: **1,797.25 tok/s**, Decode **64.23 tok/s** constant over 2k tokens, Total: **49.42 s**
+     - **64k Prefill / 500 Decode**: TTFT **36.73 s**, Prefill: **1,788.14 tok/s**, Decode: **64.16 tok/s**, Total: **44.50 s**
 
 ---
 

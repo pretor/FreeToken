@@ -119,7 +119,7 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
    - **Production Headroom & MoE Slot Tuning**: Tuned base MoE slot allocation to 16,350 slots, guaranteeing stable memory headroom for massive context extensions without triggering CUDA Out-of-Memory.
    - **Measured Production Benchmarks on 4x RTX 5060 Ti TP=4 (Qwen3.8-Flash-Next-NVFP4-QAD)**:
      - **1k Prefill / 100 Decode (3x Verified Avg)**: TTFT **1.77 s**, Prefill: **627.08 tok/s** (+16.1% vs baseline), Decode: **64.90 tok/s**, Total: **3.29 s**
-     - **8k Prefill / 1,000 Decode**: TTFT **6.85 s**, Prefill: **1,208.39 tok/s**, Decode: **67.66 tok/s**, Total: **21.61 s**
+     - **8k Prefill / 1,000 Decode (3x Verified Avg)**: TTFT **3.91 s**, Prefill: **2,114.53 tok/s**, Decode: **67.44 tok/s**, Total: **18.73 s**
      - **16k Prefill / 500 Decode (3x Verified Avg)**: TTFT **7.11 s**, Prefill: **2,316.11 tok/s** (+1.3% over PR #736), Decode: **67.46 tok/s**, Total: **14.51 s**
      - **32k Prefill / 1,000 Decode**: TTFT **13.06 s**, Prefill: **2,445.83 tok/s**, Decode: **67.87 tok/s**, Total: **27.78 s**
      - **64k Prefill / 1,000 Decode**: TTFT **52.85 s**, Prefill: **1,200.11 tok/s**, Decode: **58.25 tok/s**, Total: **70.00 s**

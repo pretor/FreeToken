@@ -102,6 +102,11 @@ def _elsize(dt: torch.dtype) -> int:
     return torch.empty((), dtype=dt).element_size()
 
 
+def _is_nvfp4_global(name: str) -> bool:
+    m = _LAYER_ENTRY_RE.match(name)
+    return (m["base"] if m else name).endswith(("gate_up_global", "down_global", ".weight_global"))
+
+
 def is_ftw_checkpoint(path: str) -> bool:
     """True if ``path`` is a directory holding a FreeToken Weight (FTW) index."""
     return os.path.isfile(os.path.join(path, INDEX_NAME))
@@ -221,6 +226,12 @@ class FTWReader:
         self.dir = path
         self.shards = sorted(self.index["shards"], key=lambda s: s["global_off"])
         self.tensors = {t["name"]: t for t in self.index["tensors"]}
+        fp16_globals = [n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)]
+        if fp16_globals:
+            logger.info(
+                "%r stores %d NVFP4 global scales as fp16 (e.g. %r); upcasting to fp32 on the fly",
+                path, len(fp16_globals), fp16_globals[0],
+            )
         self._fds: dict[str, int] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
         # O_DIRECT (DMA straight from disk, bypassing the page cache) is the fast path but a
@@ -409,6 +420,8 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), keep: Callable[[str], bool
                 reader.read_into(memoryview(buf), e, workers=workers, chunk=chunk)
                 dt = _dtype_of(e["dtype"])
                 t = torch.frombuffer(buf, dtype=dt, count=e["nbytes"] // _elsize(dt))
+                if _is_nvfp4_global(e["name"]) and dt != torch.float32:
+                    t = t.to(torch.float32)
                 # a 0-d entry (a per-tensor scale) comes back 0-d, not [1]
                 if not _put((e["name"], t.view(*e["shape"]) if e["shape"] else t.view(()), buf, e["nbytes"])):
                     return
@@ -638,13 +651,19 @@ def load_ftw_banks(
                 continue
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
             bank_shape = _get_sharded_bank_shape(base, e["shape"], tp_rank, tp_size)
-            bank = HostBank(bank_shape, _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            bank_dtype = torch.float32 if _is_nvfp4_global(base) else _dtype_of(e["dtype"])
+            bank = HostBank(bank_shape, bank_dtype, backing=_backing(layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e, layer_id))
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
+
+    fp32_globals_file = os.path.join(path, "global_scales_fp32.pt")
+    fp32_globals = torch.load(fp32_globals_file, map_location="cpu", weights_only=True) if os.path.exists(fp32_globals_file) else None
+    if fp32_globals is not None:
+        logger.info("Found exact FP32 global scales sidecar %s with %d tensors", fp32_globals_file, len(fp32_globals))
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
@@ -668,6 +687,12 @@ def load_ftw_banks(
             def _read_layer(job):
                 with torch.inference_mode():
                     _name, bank, entry, layer_id = job
+                    if fp32_globals is not None and entry["name"] in fp32_globals:
+                        full = fp32_globals[entry["name"]]
+                        _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
+                        pins.submit(bank, residency[layer_id])
+                        bar.update(entry["nbytes"])
+                        return
                     if tp_size > 1:
                         import warnings
                         pieces = list(reader._pieces(entry["global_off"], entry["nbytes"]))
@@ -681,6 +706,8 @@ def load_ftw_banks(
                             full = torch.frombuffer(
                                 entry_mv, dtype=dtype, count=entry["nbytes"] // _elsize(dtype)
                             ).view(*entry["shape"])
+                            if full.dtype != bank.tensor.dtype:
+                                full = full.to(bank.tensor.dtype)
                             _copy_sharded_bank(_name, bank.tensor, full, tp_rank, tp_size)
                         del full
                         try:
@@ -694,7 +721,13 @@ def load_ftw_banks(
                             except (AttributeError, OSError):
                                 pass
                     else:
-                        reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                        if _is_nvfp4_global(_name) and _dtype_of(entry["dtype"]) != bank.tensor.dtype:
+                            temp_buf = _transient_buffer(entry["nbytes"])
+                            reader.read_into(memoryview(temp_buf), entry, workers=workers, chunk=chunk)
+                            src = torch.frombuffer(temp_buf, dtype=_dtype_of(entry["dtype"]), count=entry["nbytes"] // _elsize(_dtype_of(entry["dtype"]))).view(*entry["shape"])
+                            bank.tensor.copy_(src.to(bank.tensor.dtype))
+                        else:
+                            reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
                     pins.submit(bank, residency[layer_id])
                     bar.update(entry["nbytes"])
 

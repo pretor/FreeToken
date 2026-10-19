@@ -50,6 +50,7 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
    - Details: [CPU vision encoder](docs/cli.md#cpu-vision-encoder); benchmark: `benchmarks/bench_cpu_vision.py`.
 
 5. **Pre-Merged Cutting-Edge Upstream PRs**:
+   - **[PR #735](https://github.com/FlashML-org/FreeToken/pull/735)**: `perf(moe): pipeline the nvfp4 prefill scale loads on geforce sm_86 / sm_89` — pipelines e4m3 block scale loads via `cp.async` (as 32-bit words), with our custom extension enabling SM_120 (`(12, 0)`) with 8 warps.
    - **[PR #736](https://github.com/FlashML-org/FreeToken/pull/736)**: `perf(moe): prefill nvfp4 moe experts on nvfp4 activations on sm_120` — W4A4 MoE prefill Gluon kernels on SM_120 for checkpoints with static activation scales.
    - **[PR #733](https://github.com/FlashML-org/FreeToken/pull/733)**: `perf(moe): speed up the nvfp4 moe prefill gemm on rtx gpus` — warp-specialized Gluon NVFP4 prefill GEMM for SM_120 with TMA and `mma.sync`.
    - **[PR #734](https://github.com/FlashML-org/FreeToken/pull/734)**: `feat(moe): bench hybrid fetch fractions per moe layer kind` — per-layer-kind bandwidth benchmarking for hybrid offload.
@@ -111,6 +112,18 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
      - **16k Prefill / 500 Decode (3x Verified Avg)**: TTFT **7.20 s**, Prefill: **2,287.34 tok/s**, Decode: **65.26 tok/s**, Total: **14.85 s**
      - **32k Prefill / 2,000 Decode**: TTFT **18.30 s**, Prefill: **1,797.25 tok/s**, Decode **64.23 tok/s** constant over 2k tokens, Total: **49.42 s**
      - **64k Prefill / 500 Decode**: TTFT **36.73 s**, Prefill: **1,788.14 tok/s**, Decode: **64.16 tok/s**, Total: **44.50 s**
+
+10. **Pipelined NVFP4 Scale Loads (PR #735) & Extended Context Scaling (up to 150k)**:
+   - **Upstream PR #735 Integration**: Pipelines e4m3 scale reading into int32 words through `cp.async` for Triton inline-dequant MoE prefill GEMM.
+   - **Blackwell SM_120 Tuning**: Extended tuning configuration (`_PREFILL_TUNING`) to explicitly activate `scale_words` and 8 warps on `(12, 0)` Blackwell GeForce GPUs.
+   - **Production Headroom & MoE Slot Tuning**: Tuned base MoE slot allocation to 16,350 slots, guaranteeing stable memory headroom for massive context extensions without triggering CUDA Out-of-Memory.
+   - **Measured Production Benchmarks on 4x RTX 5060 Ti TP=4 (Qwen3.8-Flash-Next-NVFP4-QAD)**:
+     - **1k Prefill / 100 Decode (3x Verified Avg)**: TTFT **1.77 s**, Prefill: **627.08 tok/s** (+16.1% vs baseline), Decode: **64.90 tok/s**, Total: **3.29 s**
+     - **8k Prefill / 1,000 Decode**: TTFT **6.85 s**, Prefill: **1,208.39 tok/s**, Decode: **67.66 tok/s**, Total: **21.61 s**
+     - **16k Prefill / 500 Decode (3x Verified Avg)**: TTFT **7.11 s**, Prefill: **2,316.11 tok/s** (+1.3% over PR #736), Decode: **67.46 tok/s**, Total: **14.51 s**
+     - **32k Prefill / 1,000 Decode**: TTFT **13.06 s**, Prefill: **2,445.83 tok/s**, Decode: **67.87 tok/s**, Total: **27.78 s**
+     - **64k Prefill / 1,000 Decode**: TTFT **52.85 s**, Prefill: **1,200.11 tok/s**, Decode: **58.25 tok/s**, Total: **70.00 s**
+     - **150k Prefill / 1,000 Decode**: TTFT **125.14 s**, Prefill: **1,199.48 tok/s**, Decode: **58.76 tok/s**, Peak VRAM: **16,189.4 MiB** (121.6 MiB headroom preserved, zero OOM), Total: **142.14 s** (2 min 22 s)
 
 ---
 

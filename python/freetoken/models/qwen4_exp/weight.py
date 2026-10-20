@@ -305,7 +305,12 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
         half = t.shape[0] // 2
         return _shard_rows(t, [(half, 1), (half, 1)], rank, world)
     # o_proj / down_proj: dim 1; embed_tokens / lm_head: vocab rows; others unchanged.
-    if name.endswith((".self_attn.o_proj.weight", ".shared_expert.down_proj.weight")):
+    if name.endswith((
+        ".self_attn.o_proj.weight",
+        ".self_attn.o_proj.weight_scale_inv",
+        ".shared_expert.down_proj.weight",
+        ".shared_expert.down_proj.weight_scale_inv",
+    )):
         return t.chunk(world, dim=1)[rank].clone()
     if name.endswith(("model.embed_tokens.weight", "lm_head.weight")):
         return t.chunk(world, dim=0)[rank].clone()

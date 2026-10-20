@@ -69,6 +69,13 @@ def test_shard_row_parallel_and_vocab_and_replicated():
     ):
         t = torch.randn(3, 8)
         torch.testing.assert_close(_gather(name, t, cfg, world, dim=1), t)
+    for name in (
+        "model.layers.0.self_attn.o_proj.weight_scale_inv",
+        "model.layers.1.linear_attn.out_proj.weight_scale_inv",
+        "model.layers.0.mlp.shared_expert.down_proj.weight_scale_inv",
+    ):
+        t = torch.randint(0, 255, (3, 8), dtype=torch.uint8)
+        torch.testing.assert_close(_gather(name, t, cfg, world, dim=1), t)
     gate_up = torch.randn(2 * 6, 3)
     s1 = _shard(
         "model.layers.0.mlp.shared_expert.gate_up_proj.weight", gate_up, cfg, 1, world
@@ -101,8 +108,8 @@ def test_shard_replicates_vision_tower_weights():
     assert _shard("visual.blocks.0.attn.qkv_proj.weight", t, cfg, 0, world).equal(t)
 
 
-def test_iter_weights_refuses_vision_tower_under_tp(tmp_path, monkeypatch):
-    """The model head-shards its ViT attention under TP, but nobody shards the tower weights, so both readers refuse under TP > 1 (as qwen3_vl does)."""
+def test_iter_weights_shards_vision_tower_under_tp(tmp_path, monkeypatch):
+    """The model shards its ViT weights under TP."""
     from safetensors.torch import save_file
     from freetoken.distributed.info import DistributedInfo
     from freetoken.layers.quantization import NoQuantConfig
@@ -110,7 +117,7 @@ def test_iter_weights_refuses_vision_tower_under_tp(tmp_path, monkeypatch):
     from freetoken.models.qwen4_exp import weight as w
 
     save_file(
-        {"model.visual.blocks.0.attn.qkv.weight": torch.randn(16, 8).to(torch.bfloat16)},
+        {"model.visual.blocks.0.attn.qkv.weight": torch.randn(3 * 4, 8).to(torch.bfloat16)},
         str(tmp_path / "model.safetensors"),
     )
     monkeypatch.setattr("freetoken.distributed.info._TP_INFO", DistributedInfo(rank=0, size=4))
@@ -122,11 +129,11 @@ def test_iter_weights_refuses_vision_tower_under_tp(tmp_path, monkeypatch):
     monkeypatch.setattr(w, "get_quant_config", lambda: NoQuantConfig())
     monkeypatch.setattr(q4_config, "parse_config", lambda hf: SimpleNamespace())
 
-    with pytest.raises(NotImplementedError, match="vision tower"):
-        list(w.iter_weights(str(tmp_path), torch.device("cpu"),
-                            include_moe_experts=False, include_non_moe=True))
-    with pytest.raises(NotImplementedError, match="vision tower"):
-        list(w.iter_vision_weights(str(tmp_path), torch.device("cpu")))
+    w_dict = dict(w.iter_weights(str(tmp_path), torch.device("cpu"),
+                                 include_moe_experts=False, include_non_moe=True))
+    assert "visual.blocks.0.attn.qkv.weight" in w_dict
+    w_vis = dict(w.iter_vision_weights(str(tmp_path), torch.device("cpu")))
+    assert "visual.blocks.0.attn.qkv.weight" in w_vis
 
 
 def test_shard_rejects_unshardable_dense_kinds():

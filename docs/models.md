@@ -62,6 +62,26 @@ have no resident path and stay on `offload`. Offload-only flags
 `--moe-prefill-hit-d2d`, `--disable-moe-prefill-overlap`) are ignored with a
 warning; pass `--moe-strategy offload` to use them.
 
+### Hosts that cap pinned memory (WSL)
+
+WSL caps CUDA pinned memory near half of RAM, so the expert banks of a large
+model may not all pin. With `--moe-cpu-layers auto`, FreeToken loads the banks
+first, then pins them layer by layer from the middle out until CUDA refuses one;
+the remaining head and tail layers are OS-locked instead (resident, but with no
+device address). After a refusal under WDDM (WSL and native Windows) it
+unpins about 3 GiB more (`FREETOKEN_PIN_PROBE_MARGIN_GB`) so later CUDA
+allocations still fit.
+`FREETOKEN_PIN_BUDGET_GB` replaces the probe with a fixed budget: the locked
+layers are then picked from a size estimate before the load, and a refused pin
+stops the boot.
+
+Under `hybrid`, a locked layer keeps GPU slots of its own pools. Each decode
+step it fetches a share of its misses (`--moe-locked-fetch`, by default from the `ft bench bw` profile): CPU threads
+copy the experts into a small pinned staging buffer
+(`--moe-locked-max-fetch` rows per bank) and the GPU copies them into the
+slots. The CPU computes the remaining misses, as on any hybrid layer. Under
+`offload`, locked layers decode on the CPU.
+
 ### NVLink-C2C hosts (GH200 / GB200)
 
 The host link is ~450 GB/s per direction instead of PCIe's ~32-64 GB/s. The
@@ -78,6 +98,7 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
 
 ## Notes
 
+- A checkpoint that fails to load: from a source checkout, run `PYTHONPATH=python python scripts/checkpoint_diagnose/diagnose.py <checkpoint dir or HF repo id>`. It reads the headers, not the weights, says whether FreeToken or the checkpoint is at fault, and for a local checkpoint gives the commands that fix a non-standard one; see [its README](../scripts/checkpoint_diagnose/README.md). GGUF files are checked with [scripts/gguf_check](../scripts/gguf_check/README.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - An FTW converted by an older build with `--moe-backend fused` or `triton` keeps
@@ -88,6 +109,9 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
 - NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
   older build) is refused at load; reconvert it with `ft checkpoint`.
+- Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
+  fp32 at runtime. An FTW of these models converted by an older build stores the norms with the 1
+  already added: it loads without an error but gives wrong output; reconvert it with `ft checkpoint`.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`
   refuses it unless started with `--text-model-only` (or `--mm-disable vision`); reconvert it
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).

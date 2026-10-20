@@ -228,9 +228,15 @@ class FTWReader:
         self.tensors = {t["name"]: t for t in self.index["tensors"]}
         fp16_globals = [n for n, t in self.tensors.items() if t["dtype"] == "float16" and _is_nvfp4_global(n)]
         if fp16_globals:
+<<<<<<< HEAD
             logger.info(
                 "%r stores %d NVFP4 global scales as fp16 (e.g. %r); upcasting to fp32 on the fly",
                 path, len(fp16_globals), fp16_globals[0],
+=======
+            raise ValueError(
+                f"{path!r} stores NVFP4 global scales as fp16 (e.g. {fp16_globals[0]!r}) but FreeToken reads them as fp32; "
+                "reconvert it from the source checkpoint with `ft checkpoint`"
+>>>>>>> test-upstream-pr742
             )
         self._fds: dict[str, int] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}

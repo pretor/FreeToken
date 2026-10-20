@@ -73,22 +73,38 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             and isinstance(se.down_proj, LinearRowParallel)
             and isinstance(ex, OffloadMoELayer)
         ):
-            act = silu_and_mul(se.gate_up_proj.forward(hidden_states))
-            shared = se.down_proj.quant_method.apply(se.down_proj, act)
             is_prefill = get_global_ctx().batch.is_prefill
-            if is_prefill and _AR_GROUP > 0 and num_tokens > _AR_GROUP:
-                out = self._prefill_grouped(ex, hidden_states, router_logits, shared, gate)
-            elif is_prefill:
-                routed = ex.prefill_forward(hidden_states, router_logits)
+            if is_prefill:
+                act = silu_and_mul(se.gate_up_proj.forward(hidden_states))
+                shared = se.down_proj.quant_method.apply(se.down_proj, act)
+                if _AR_GROUP > 0 and num_tokens > _AR_GROUP:
+                    out = self._prefill_grouped(ex, hidden_states, router_logits, shared, gate)
+                else:
+                    routed = ex.prefill_forward(hidden_states, router_logits)
+                    out = self._comm.all_reduce(shared_gate_mul_add(routed, shared, gate))
+                    if ex.offload_cache is not None:
+                        ex.offload_cache.mark_layer_reduced(ex.layer_id)
+            elif ex.can_overlap_shared(hidden_states):
+                def calc_shared():
+                    act = silu_and_mul(se.gate_up_proj.forward(hidden_states))
+                    return se.down_proj.quant_method.apply(se.down_proj, act)
+                routed, shared = ex.decode_forward_with_shared(hidden_states, router_logits, calc_shared)
                 out = self._comm.all_reduce(shared_gate_mul_add(routed, shared, gate))
-                if ex.offload_cache is not None:
-                    ex.offload_cache.mark_layer_reduced(ex.layer_id)
             else:
+                act = silu_and_mul(se.gate_up_proj.forward(hidden_states))
+                shared = se.down_proj.quant_method.apply(se.down_proj, act)
                 routed = ex.decode_forward(hidden_states, router_logits)
                 out = self._comm.all_reduce(shared_gate_mul_add(routed, shared, gate))
             return out.view(num_tokens, hidden_dim)
-        shared = se.forward(hidden_states)
-        routed = ex.forward(hidden_states=hidden_states, router_logits=router_logits)
+
+        can_overlap = getattr(ex, "can_overlap_shared", None)
+        if can_overlap is not None and can_overlap(hidden_states):
+            routed, shared = ex.decode_forward_with_shared(
+                hidden_states, router_logits, lambda: se.forward(hidden_states)
+            )
+        else:
+            shared = se.forward(hidden_states)
+            routed = ex.forward(hidden_states=hidden_states, router_logits=router_logits)
         return routed.view(num_tokens, hidden_dim), shared, gate
 
     def _prefill_grouped(

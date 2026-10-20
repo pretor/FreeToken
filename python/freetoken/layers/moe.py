@@ -244,6 +244,50 @@ class OffloadMoELayer(MoELayer):
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
+    def can_overlap_shared(self, hidden_states: torch.Tensor) -> bool:
+        cache = self.offload_cache
+        return (
+            cache is not None
+            and getattr(cache, "decode_shared_overlap", None) is not None
+            and not get_global_ctx().batch.is_prefill
+            and hidden_states.shape[0] == 1
+            and cache.decode_target == "gpu"
+            and not cache.is_cpu_layer(self.layer_id)
+            and not cache.is_unpinned_layer(self.layer_id)
+            and getattr(cache, "_copy_fused_ok", True)
+            and not getattr(cache, "layer_major_active", False)
+        )
+
+    def decode_forward_with_shared(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor | None,
+        shared_forward,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self.offload_cache
+        assert cache is not None
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache.ensure_experts(self.layer_id, topk_ids)
+        shared = cache.decode_shared_overlap.run(
+            self.layer_id, cache.copy_missing, shared_forward,
+        )
+        routed = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.pool_bank_views(self.layer_id),
+            n=None,
+            alphas=cache.alphas_for_slots(self.layer_id),
+            is_prefill=False,
+        )
+        return routed, shared
+
     def decode_forward(
         self,
         hidden_states: torch.Tensor,

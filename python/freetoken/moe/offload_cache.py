@@ -374,6 +374,14 @@ class OffloadMoeCache:
             self._resolve_batch_memcpy()
         self._slice_pools()
 
+        from freetoken.decode_overlap import DecodeSharedOverlap, enabled
+
+        self.decode_shared_overlap = (
+            DecodeSharedOverlap(torch.cuda, self.device, num_layers=self.num_layers)
+            if enabled() and self.device.type == "cuda" and self.decode_target == "gpu"
+            else None
+        )
+
     def _pool_layout(self, pool: int) -> int:
         return self.layer_layout[self.pool_of_layer.index(pool)]
 

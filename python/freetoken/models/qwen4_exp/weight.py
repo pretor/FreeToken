@@ -28,6 +28,8 @@ from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
+from freetoken.models.config import VISION_KEY_PREFIXES
+from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
@@ -69,10 +71,14 @@ _PLE_SHARD_RE = re.compile(
 # Gemma-style zero-centered RMSNorm: the checkpoint stores the offset `w` rather than the
 # runtime multiplier `1 + w`. The engine models have that +1 folded into their RMSNorm.
 _ZERO_CENTERED_NORM_SUFFIXES = (
-    ".input_layernorm.weight",
-    ".post_attention_layernorm.weight",
-    ".q_norm.weight",
-    ".k_norm.weight",
+    ".hc_norm.weight",
+    ".ple.norm_key.weight",
+    ".ple.norm_query.weight",
+    ".ple.norm_conv.weight",
+    ".self_attn.q_norm.weight",
+    ".self_attn.k_norm.weight",
+    ".self_attn.indexer.q_layernorm.weight",
+    ".self_attn.indexer.k_layernorm.weight",
 )
 
 # Layers whose fused projections pad rows to a multiple of 16 so Triton kernels stay aligned.
@@ -431,14 +437,49 @@ def _safetensors_header(path: str) -> tuple[dict, int]:
 def _ple_table_files(folder: str) -> list[str]:
     """Shards holding a piece of the n-gram table, from the index when there is one."""
     index = os.path.join(folder, "model.safetensors.index.json")
-    if os.path.exists(index):
-        with open(index) as fh:
-            weight_map = json.load(fh)["weight_map"]
-        files = {v for k, v in weight_map.items() if _PLE_TABLE_INFIX in k}
-        return [os.path.join(folder, f) for f in sorted(files)]
-    import glob
-    return sorted(glob.glob(os.path.join(folder, "model-plefp8-*.safetensors")))
+    if not os.path.exists(index):
+        return sorted(iter_weight_files(folder))
+    with open(index, encoding="utf-8") as fh:
+        weight_map = json.load(fh)["weight_map"]
+    files = {shard for name, shard in weight_map.items() if _PLE_TABLE_INFIX in name}
+    return sorted(os.path.join(folder, shard) for shard in files)
 
+
+
+_PLE_FILE_BYTES = 4 << 30  # ple-table-*.safetensors written by ftw_side_files
+
+
+def ftw_side_files(model_path: str, out_dir: str) -> list[str]:
+    """Write the PLE n-gram table tensors, and only those, into ``ple-table-*.safetensors`` next to an FTW checkpoint.
+
+    The table is served from safetensors files in the checkpoint dir (see load_ple_table), not from FTW entries."""
+    from safetensors.torch import save_file
+
+    folder = download_hf_weight(model_path)
+    written: list[str] = []
+    batch: dict[str, torch.Tensor] = {}
+    size = 0
+
+    def flush():
+        nonlocal batch, size
+        if batch:
+            name = f"ple-table-{len(written):05d}.safetensors"
+            save_file(batch, os.path.join(out_dir, name))
+            written.append(name)
+            batch, size = {}, 0
+
+    for path in _ple_table_files(folder):
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if _PLE_TABLE_INFIX not in key:
+                    continue
+                t = f.get_tensor(key)
+                batch[key] = t
+                size += t.numel() * t.element_size()
+                if size >= _PLE_FILE_BYTES:
+                    flush()
+    flush()
+    return written
 
 def dump_ple_table(folder: str, shards: dict[str, torch.Tensor],
                    qwen4_args, *, workers: int = 4) -> list[str]:
@@ -616,6 +657,7 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
 
 
 __all__ = [
+    "ftw_side_files",
     "PleTable",
     "iter_vision_weights",
     "iter_weights",

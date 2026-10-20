@@ -32,6 +32,14 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 _COPY_DEFER = os.getenv("FREETOKEN_PREFILL_COPY_DEFER", "off").strip().lower()
 assert _COPY_DEFER in ("off", "prev_ar"), f"FREETOKEN_PREFILL_COPY_DEFER={_COPY_DEFER!r}"
 
+# Issue #752 (C0 transport knobs):
+# PREFILL_COPY_PRIORITY gives the prefill copy stream the highest stream priority (-1),
+# so bookkeeping and DMA transfers are not starved behind GEMM blocks.
+# PREFILL_EPOCH_INVALIDATE unmaps both double buffers once per prefill epoch on the compute
+# stream, keeping the copy stream completely free of bookkeeping kernels.
+_PREFILL_COPY_PRIORITY = os.getenv("FREETOKEN_PREFILL_COPY_PRIORITY", os.getenv("QWEN36_PREFILL_COPY_PRIORITY", "0")).strip().lower() not in {"0", "false", "no", "off"}
+_PREFILL_EPOCH_INVALIDATE = os.getenv("FREETOKEN_PREFILL_EPOCH_INVALIDATE", os.getenv("QWEN36_PREFILL_EPOCH_INVALIDATE", "0")).strip().lower() not in {"0", "false", "no", "off"}
+
 from freetoken.kernel.fast_index_copy import default_blocks_per_bank
 from freetoken.utils import init_logger
 
@@ -339,6 +347,9 @@ class OffloadMoeCache:
         self.prefill_begin_event: torch.cuda.Event | None = None
         self.prefill_ready_events: list[torch.cuda.Event] = []
         self.prefill_release_events: list[torch.cuda.Event] = []
+        self.prefill_copy_priority: bool = _PREFILL_COPY_PRIORITY
+        self.prefill_epoch_invalidate: bool = _PREFILL_EPOCH_INVALIDATE
+        self._prefill_epoch_open: bool = False
         self._prefill_buffer_layer: list[int | None] = [None, None]
         self._prefill_buffer_released: list[bool] = [True, True]
         self._prefill_buffer_has_release_event: list[bool] = [False, False]
@@ -919,8 +930,10 @@ class OffloadMoeCache:
         self._prefill_buffer_has_release_event = [False, False]
         self._release_pending = [None, None]
         # the double buffers are the staging views (_slice_pools), on top of the first pools' slots
+        self._prefill_epoch_open = False
         if self.device.type == "cuda":
-            self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
+            priority = -1 if getattr(self, "prefill_copy_priority", False) else 0
+            self.prefill_copy_stream = torch.cuda.Stream(device=self.device, priority=priority)
             self.prefill_ready_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_release_events = [torch.cuda.Event() for _ in range(2)]
             self.prefill_begin_event = torch.cuda.Event()
@@ -937,7 +950,7 @@ class OffloadMoeCache:
             )
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
 
-    def _invalidate_prefill_buffer(self, buffer_id: int, layer_id: int) -> None:
+    def _invalidate_prefill_buffer(self, buffer_id: int, layer_id: int = 0) -> None:
         """Take buffer ``buffer_id``'s slots for staging ``layer_id``."""
         slots = self._inval[buffer_id]
         if isinstance(slots, slice):
@@ -957,8 +970,10 @@ class OffloadMoeCache:
             self.usage[slots] = 0
         self._stage_dirty[buffer_id] = True
         # the pad may hold rows of a wider layout or of a pool
-        for tail in self._stage_tails[self.layer_layout[layer_id]][buffer_id]:
-            tail.zero_()
+        if self._stage_tails:
+            layout_idx = self.layer_layout[layer_id] if layer_id < len(self.layer_layout) else 0
+            for tail in self._stage_tails[layout_idx][buffer_id]:
+                tail.zero_()
 
     def begin_prefill(self) -> None:
         self._chunk_hit_rows = 0
@@ -969,6 +984,12 @@ class OffloadMoeCache:
             self._flush_pending_release(b)
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
+        if self.prefill_copy_stream is not None and getattr(self, "prefill_epoch_invalidate", False):
+            # Compute-stream order puts this after any decode that mapped buffer slots and
+            # before the fence below, so every copy of this epoch lands in unmapped slots.
+            self._invalidate_prefill_buffer(0, 0)
+            self._invalidate_prefill_buffer(1, 0)
+            self._prefill_epoch_open = True
         if self.prefill_copy_stream is not None:
             # Fence this prefill's copy-stream work behind everything already enqueued
             # on the compute stream. The release/ready events only order against the
@@ -1004,7 +1025,8 @@ class OffloadMoeCache:
             )
 
         def copy() -> None:
-            self._invalidate_prefill_buffer(buffer_id, layer_id)
+            if not getattr(self, "_prefill_epoch_open", False):
+                self._invalidate_prefill_buffer(buffer_id, layer_id)
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, buffer_id)):
                 view.copy_(per_layer[layer_id], non_blocking=True)
 
@@ -1123,7 +1145,8 @@ class OffloadMoeCache:
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
                 self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
-            self._invalidate_prefill_buffer(buffer_id, layer_id)
+            if not getattr(self, "_prefill_epoch_open", False):
+                self._invalidate_prefill_buffer(buffer_id, layer_id)
             if miss.size:
                 run_starts = np.concatenate(([0], np.nonzero(np.diff(miss) != 1)[0] + 1))
                 starts = miss[run_starts]
@@ -1169,6 +1192,7 @@ class OffloadMoeCache:
 
     def release_prefill_layer(self, layer_id: int) -> None:
         if layer_id == self.num_layers - 1:
+            self._prefill_epoch_open = False
             # the staged slots were invalidated and nothing registers them within the forward, so their bytes are free to clear
             for b in range(2):
                 if self._stage_dirty[b]:
@@ -1281,6 +1305,7 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
+        self._prefill_epoch_open = False
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)

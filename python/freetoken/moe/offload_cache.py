@@ -382,6 +382,10 @@ class OffloadMoeCache:
             else None
         )
 
+        from freetoken.kernel.decode_gather import decode_gather_config
+
+        self._decode_gather = decode_gather_config()
+
     def _pool_layout(self, pool: int) -> int:
         return self.layer_layout[self.pool_of_layer.index(pool)]
 
@@ -1444,6 +1448,20 @@ class OffloadMoeCache:
         # materialize stages rows of staging buffer 0; ensure stages slots local to the layer's pool
         whole = self._pending_whole_layer
         if self._copy_fused_ok:
+            if not whole and getattr(self, "_decode_gather", None) is not None:
+                from freetoken.kernel.decode_gather import decode_gather_jit
+
+                decode_gather_jit(
+                    self._copy_dst_ptrs_pool[self.pool_of_layer[layer_id]],
+                    self._copy_src_ptrs[layer_id],
+                    self._copy_feat_bytes[self.layer_layout[layer_id]],
+                    self.evict_slots,
+                    self.src_indices,
+                    self.num_indices,
+                    config=self._decode_gather,
+                )
+                return
+
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per

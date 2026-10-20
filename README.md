@@ -125,6 +125,25 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
      - **64k Prefill / 1,000 Decode**: TTFT **52.85 s**, Prefill: **1,200.11 tok/s**, Decode: **58.25 tok/s**, Total: **70.00 s**
      - **150k Prefill / 1,000 Decode**: TTFT **125.14 s**, Prefill: **1,199.48 tok/s**, Decode: **58.76 tok/s**, Peak VRAM: **16,189.4 MiB** (121.6 MiB headroom preserved, zero OOM), Total: **142.14 s** (2 min 22 s)
 
+11. **Production Offload Transport Overhauls: Priority Copy Stream, CUDA-Graph Shared-Expert Overlap & TMA Hardware Gather (Issues #752, #753, #751)**:
+   - **[Issue #752](https://github.com/FlashML-org/FreeToken/issues/752) — Prefill Copy Stream Priority & Epoch Invalidation (`FREETOKEN_PREFILL_COPY_PRIORITY`, `FREETOKEN_PREFILL_EPOCH_INVALIDATE`)**:
+     - **The Bottleneck**: Upstream ran prefill double-buffer copy streams at default priority (`0`), launching ~240 small bookkeeping kernels (`_invalidate_prefill_buffer`) per prefill directly on the copy stream. Those kernels sat in queue behind the compute GEMMs, stalling the hardware DMA engine for ~1.4 ms per layer.
+     - **The Fix**: Prefill copy stream is elevated to `priority=-1` (highest hardware dispatch priority), and both double buffers are unmapped once per prefill epoch in `begin_prefill()` on the compute stream. The copy stream now carries exclusively DMA work (`cudaMemcpyBatchAsync`), eliminating all bookkeeping bubbles.
+   - **[Issue #753](https://github.com/FlashML-org/FreeToken/issues/753) — Decode Miss Gather & Shared-Expert Overlap in CUDA Graph (`FREETOKEN_DECODE_SHARED_OVERLAP`)**:
+     - **The Bottleneck**: In offloaded decode, each layer executed `ensure_experts`, `copy_missing` (PCIe gather of un-cached routed experts), shared expert computation, and routed GEMM sequentially on the compute stream—even though the shared expert does not depend on missed routed experts.
+     - **The Fix**: Introduced `DecodeSharedOverlap` with pre-materialized CUDA event pairs (`ready` and `done`) for all 40 layers. The PCIe miss gather (`copy_missing`) forks to a dedicated background stream while the shared expert MLP (`gate_up_proj` + `silu_and_mul` + `down_proj`) computes concurrently on the compute stream. They join seamlessly before `_expert_gemm` and are 100% captured inside the decode CUDA graph across TP=4 ranks without any host synchronization.
+   - **[Issue #751](https://github.com/FlashML-org/FreeToken/issues/751) — TMA Asynchronous Bulk Transfer Gather (`FREETOKEN_DECODE_GATHER=tuned`)**:
+     - **The Bottleneck**: Legacy decode expert gather dispatched `fast_index_copy_multi` across 48 CTAs x 1024 threads issuing small 16-byte `ld.global` instructions, causing memory queue pressure across PCIe.
+     - **The Fix**: Implemented hardware Tensor Memory Accelerator (TMA) bulk transfers via `DecodeGatherTmaKernel` (`decode_gather.cuh`). Total missed expert bytes are split evenly across 8 CTAs using a 3-stage shared-memory ring (16 KiB chunks, 48 KiB shared memory).
+     - **Blackwell SM_120 Bug Prevention**: Standard `.shared::cluster` TMA triggers an NVIDIA driver bug on SM_120 that inflates per-thread stack budget to 14,416 B, leaking 1.37 GiB VRAM per GPU. Our implementation strictly targets native `.shared::cta` (`cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes`), ensuring **0 B VRAM overhead** and 100% bit-exact expert gathers.
+   - **Measured Production Benchmarks on 4x RTX 5060 Ti TP=4 (Qwen3.8-Flash-Next-NVFP4-QAD)**:
+     - **1k Prefill / 1,000 Decode**: TTFT **1.81 s**, Prefill: **611.16 tok/s**, Decode: **67.84 tok/s**, Total: **16.54 s**
+     - **8k Prefill / 1,000 Decode**: TTFT **3.87 s** (down from 3.97 s baseline), Prefill: **2,137.56 tok/s**, Decode: **68.11 tok/s**, Total: **18.58 s**
+     - **16k Prefill / 500 Decode (3x Verified Avg)**: TTFT **7.24 s**, Prefill: **2,274.03 tok/s**, Decode: **68.66 tok/s** (Peak: **68.99 tok/s**, +4.6% vs baseline), Total: **14.51 s**
+     - **16k Prefill / 1,000 Decode (3x Verified Avg)**: TTFT **7.21 s** (steady across all runs), Prefill: **2,282.63 tok/s**, Decode: **67.90 tok/s**, Total: **21.93 s**
+     - **32k Prefill / 1,000 Decode**: TTFT **12.88 s**, Prefill: **2,481.53 tok/s**, Decode: **66.83 tok/s**, Total: **27.82 s**
+     - **Concurrent Throughput (2x 16k Prefill + 1,000 Decode)**: Processed **34,143 tokens** in **30.70 s** — Aggregate Prefill: **2,449.67 tok/s**, Aggregate Decode: **113.62 tok/s**, System Throughput: **1,112.01 tok/s**.
+
 ---
 
 ### Tested & Verified Models:

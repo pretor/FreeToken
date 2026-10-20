@@ -248,21 +248,21 @@ class _DenseReader:
         return out
 
 
-def _shard_rows(t: torch.Tensor, heads: list[tuple[int, int]], rank: int, world: int) -> torch.Tensor:
-    """Slice grouped-head row blocks in dim 0 across tensor-parallel ranks.
-
-    ``heads`` is a list of ``(head_count, head_dim)`` tuples matching the row layout.
-    Each block's head count must divide evenly by ``world``.
-    """
-    slices = []
-    offset = 0
-    for num_heads, head_dim in heads:
-        per_rank = div_even(num_heads, world)
-        start = offset + rank * per_rank * head_dim
-        end = start + per_rank * head_dim
-        slices.append(t[start:end])
-        offset += num_heads * head_dim
-    return torch.cat(slices, dim=0)
+def _shard_rows(
+    t: torch.Tensor, parts: list[tuple[int, int]], rank: int, world: int
+) -> torch.Tensor:
+    """Column-parallel slice (dim 0) of a ``[part0 | part1 | ...]`` fusion; ``parts`` gives each
+    part as ``(heads, rows_per_head)``. Heads split evenly across ranks; a part with fewer heads
+    than ranks (GQA kv) replicates head ``rank * heads // world``, the ``div_even(...,
+    allow_replicate=True)`` convention of the TP-aware layers."""
+    out, off = [], 0
+    for heads, rows in parts:
+        local = div_even(heads, world, allow_replicate=True)
+        first = rank * heads // world
+        out.append(t[off + first * rows : off + (first + local) * rows])
+        off += heads * rows
+    assert off == t.shape[0], f"fusion parts {parts} cover {off} rows, tensor has {t.shape[0]}"
+    return torch.cat(out, dim=0)
 
 
 def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.Tensor:

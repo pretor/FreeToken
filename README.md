@@ -144,6 +144,21 @@ This fork by **[@pretor](https://github.com/pretor)** is specifically engineered
      - **32k Prefill / 1,000 Decode**: TTFT **12.88 s**, Prefill: **2,481.53 tok/s**, Decode: **66.83 tok/s**, Total: **27.82 s**
      - **Concurrent Throughput (2x 16k Prefill + 1,000 Decode)**: Processed **34,143 tokens** in **30.70 s** — Aggregate Prefill: **2,449.67 tok/s**, Aggregate Decode: **113.62 tok/s**, System Throughput: **1,112.01 tok/s**.
 
+12. **Upstream Synchronization (`upstream/main` @ `cc56b6b`) & PR #742 (`feat(moe): fetch locked-layer experts through pinned staging`)**:
+   - **Upstream Sync (`cc56b6b`)**: Merged all upstream updates including:
+     - **[PR #759](https://github.com/FlashML-org/FreeToken/pull/759)**: Strict weight reading adhering to checkpoint-declared `QuantConfig` (`_DenseReader`).
+     - **[PR #760](https://github.com/FlashML-org/FreeToken/pull/760)**: GGUF checkpoint loading with quantized indexers for `qwen4_exp`.
+     - **[PR #755](https://github.com/FlashML-org/FreeToken/pull/755)**: Runtime zero-centered RMSNorm (+1 in FP32) stabilization.
+     - **[PR #721](https://github.com/FlashML-org/FreeToken/pull/721)**: GLM-5.3-Flash GGUF checkpoint serving support on `glm5-next`.
+     - **[PR #762](https://github.com/FlashML-org/FreeToken/pull/762) & [PR #756](https://github.com/FlashML-org/FreeToken/pull/756)**: Checkpoint diagnosis, tensor renaming, and GGUF inspection tools (`scripts/checkpoint_diagnose/`, `scripts/gguf_check/`).
+   - **PR #742 Integration**: Incorporated Xiaoze Fan's locked-layer expert fetch pipeline:
+     - Dedicated multi-threaded pinned staging buffer (`_cpu_moe.LockedFetch`, `python/freetoken/moe/locked_fetch.py`).
+     - Accelerated gathering of locked-layer expert misses via `fast_index_copy_multi` in C++/CUDA (`locked_fetch.cpp`, `locked_fetch_io.cu`).
+     - Recompiled and linked C++/CUDA extensions with native Blackwell SM_120 support.
+   - **Full Backward Compatibility & TP=4 Preserved**:
+     - Maintained automatic on-the-fly FP16 -> FP32 NVFP4 global scale upcasting for legacy FTW checkpoints.
+     - Retained complete multi-GPU TP=4 tensor sharding and `/dev/shm` shared memory PLE table mapping.
+
 ---
 
 ### Tested & Verified Models:

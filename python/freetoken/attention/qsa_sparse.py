@@ -50,6 +50,7 @@ _CPU_PINNED = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 # Block-score transient budget (vLLM's number): the fp32 [rows, n_blocks] logits tile is
 # 256 KB per row at a 1M-token context, so a long prefill must be scored in row chunks.
 _LOGITS_WORKSPACE_BYTES = 128 << 20
+_SCORE_ROWS = 16  # prefill query rows per score program (qsa_mqa_paged_rows)
 
 
 TORCH_TOPK_ENV = "FREETOKEN_QSA_TORCH_TOPK"
@@ -92,6 +93,8 @@ class QSASparseMetadata(BaseAttnMetadata):
     rope_rows:        torch.Tensor | None = None  # [T] int32 arange
     q_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
     k_rope_cache:     torch.Tensor | None = None  # [T, rotary_dim] float32
+    # Prefill scoring: row-tile maps per (start, end) row chunk, built by the first QSA layer.
+    score_tiles:      dict | None = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
@@ -402,6 +405,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             expand_qsa_block_indices,
             qsa_index_norm_rope,
             qsa_mqa_paged,
+            qsa_mqa_paged_rows,
+            qsa_score_tile_map,
         )
 
         rows = index.q.shape[0]
@@ -426,22 +431,48 @@ class QSASparseAttnBackend(BaseAttnBackend):
         columns = md.block_table.shape[1] * self.cmp_page_size
         indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
+        row_tiles = not md.is_decode and self.index_heads == 4
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
             chunk = slice(start, end)
             logits = self._scratch("logits", end - start, columns, dtype=torch.float32)
             visible = self._scratch("visible", end - start, dtype=torch.int32)
-            qsa_mqa_paged(
-                q_index[chunk],
-                cmp_pages,
-                md.block_table,
-                md.token_to_req[chunk],
-                positions[chunk],
-                md.seq_lens,
-                self.ratio,
-                logits,
-                visible,
-            )
+            if row_tiles:
+                # Prefill: several query rows of one request per program (decode, which a
+                # graph may capture, keeps the one-row kernel). Same scores bit for bit.
+                if md.score_tiles is None:
+                    md.score_tiles = {}
+                tile_map = md.score_tiles.get((start, end))
+                if tile_map is None:
+                    tile_map = qsa_score_tile_map(
+                        md.qo_indptr_cpu, start, end, _SCORE_ROWS, self.device
+                    )
+                    md.score_tiles[(start, end)] = tile_map
+                qsa_mqa_paged_rows(
+                    q_index[chunk],
+                    cmp_pages,
+                    md.block_table,
+                    tile_map,
+                    md.token_to_req[chunk],
+                    positions[chunk],
+                    md.seq_lens,
+                    self.ratio,
+                    logits,
+                    visible,
+                    rows_per_tile=_SCORE_ROWS,
+                )
+            else:
+                qsa_mqa_paged(
+                    q_index[chunk],
+                    cmp_pages,
+                    md.block_table,
+                    md.token_to_req[chunk],
+                    positions[chunk],
+                    md.seq_lens,
+                    self.ratio,
+                    logits,
+                    visible,
+                )
             blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
             self._top_blocks(logits, visible, blocks)
             expand_qsa_block_indices(

@@ -3,7 +3,7 @@
 from .attend import qsa_sparse_paged_attention
 from .compress import qsa_compress_groups, qsa_index_norm_rope, qsa_store_rows
 from .expand import expand_qsa_block_indices
-from .score import qsa_mqa_paged
+from .score import qsa_mqa_paged, qsa_mqa_paged_rows, qsa_score_tile_map
 from .topk import qsa_block_topk, qsa_block_topk_scratch_width
 
 __all__ = [
@@ -13,6 +13,8 @@ __all__ = [
     "qsa_compress_groups",
     "qsa_index_norm_rope",
     "qsa_mqa_paged",
+    "qsa_mqa_paged_rows",
+    "qsa_score_tile_map",
     "qsa_sparse_paged_attention",
     "qsa_store_rows",
 ]

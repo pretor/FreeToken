@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import gc
+import os
 import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
@@ -119,7 +120,11 @@ def _upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream) -> Non
     """Upload the graph at capture time.
 
     Otherwise the first replay pushes every node behind the graph's own stream WAIT, and a large graph then blocks cudaGraphLaunch until the WAIT is released. PLE wait-sync releases it only after the launch returns, so that deadlocks.
+    Capture-time cuGraphUpload widens inter-kernel gaps on Blackwell (Issue #775).
     """
+    flag = os.getenv("FREETOKEN_GRAPH_UPLOAD", "auto").strip().lower()
+    if flag in ("0", "false", "no", "off"):
+        return
     upload = _cu_graph_upload()
     if upload is None or stream is None or not hasattr(graph, "raw_cuda_graph_exec"):
         return

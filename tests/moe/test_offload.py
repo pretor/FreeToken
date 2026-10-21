@@ -615,6 +615,16 @@ def test_adjust_config_drops_the_demand_prefill_threshold_for_a_dense_model():
     assert config.moe_prefill_demand_tokens == 0
 
 
+def test_upload_graph_respects_disable_env(monkeypatch):
+    from freetoken.engine.graph import _upload_graph
+
+    called = []
+    monkeypatch.setenv("FREETOKEN_GRAPH_UPLOAD", "0")
+    monkeypatch.setattr("freetoken.engine.graph._cu_graph_upload", lambda: called.append(True))
+    _upload_graph(None, None)
+    assert not called, "_upload_graph should not call _cu_graph_upload when FREETOKEN_GRAPH_UPLOAD=0"
+
+
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     import freetoken.core as core
     from freetoken.core import Context, Req, get_global_ctx

@@ -816,6 +816,8 @@ def parse_args(
             "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
             "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
             "Not for a table tied to the LM head."
+        ),
+    )
 
     parser.add_argument(
         "--embed-device",
@@ -825,8 +827,6 @@ def parse_args(
         convert=lambda v: "host" if v == "cpu" else v,
         choices=["gpu", "cpu"],
         help=argparse.SUPPRESS,
-    )
-        ),
     )
 
     parser.add_argument(

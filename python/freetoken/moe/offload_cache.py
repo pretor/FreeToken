@@ -145,7 +145,7 @@ class OffloadMoeCache:
     prefill_overlap: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
-    # of re-crossing PCIe; only the misses are H2D'd (one cudaMemcpyBatchAsync of
+    # of re-crossing PCIe; only the misses are H2D'd (one CUDA/HIP batch memcpy of
     # coalesced runs). Requires prefill_overlap, cache_size > 2 * num_experts and
     # the fused copy plan; silently falls back to the full-layer copy otherwise.
     prefill_hit_d2d: bool = False
@@ -339,6 +339,7 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        self._pending_fetch_cap: int | None = None  # the last hybrid ensure's cap on its fetch count
         # The two prefill staging buffers are the first 2 * _stage_bytes[k] bytes of every bank, on top of the first pools.
         # _stage_views[g][b] are buffer b's per-bank [num_experts, ...] views for layout g; _inval[b] are the global slots it overwrites.
         self._stage_bytes: list[int] = []
@@ -1081,7 +1082,7 @@ class OffloadMoeCache:
                 f"(every slot lies under the prefill staging buffers of {2 * self.num_experts} experts)"
             )
         elif not self._resolve_batch_memcpy():
-            reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
+            reason = "batch memcpy is unavailable"  # resolve logged the specifics
         else:
             return True
         if not self._hit_d2d_fallback_logged:
@@ -1112,7 +1113,7 @@ class OffloadMoeCache:
         fixed-shape gather indices (no host round trip), then fast_index_copy_multi
         moves the rows. Serializing the gather before this layer's GEMMs costs its
         plain duration instead of nondeterministic SM contention. Misses cross
-        PCIe as ONE cudaMemcpyBatchAsync of coalesced expert-id runs on the copy
+        PCIe as ONE batch memcpy of coalesced expert-id runs on the copy
         stream, under the existing release/ready event discipline; its host-built
         run list comes from the begin-of-chunk snapshot because the batch API
         takes HOST pointer arrays. Live-vs-snapshot cannot disagree: the only
@@ -1311,6 +1312,7 @@ class OffloadMoeCache:
         if layer_id in self.locked_hybrid:
             # a locked layer fetches through the staging, so at most its rows per step
             (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
+        self._pending_fetch_cap = cap
         return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
 
     def materialize_layer(self, layer_id: int) -> None:

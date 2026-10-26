@@ -16,15 +16,16 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
+from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS, check_cpu_encoder_support
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
+from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import PinFailed
+from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
@@ -338,10 +339,44 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             )
 
 
+def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
+    if config.embed_weights != "host":
+        return frozenset()
+    if config.model_config.tie_word_embeddings:
+        raise ValueError(
+            "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
+            "every step; serve it with --embed-weights gpu"
+        )
+    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys:
+        raise ValueError(
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
+            "on the GPU); serve it with --embed-weights gpu"
+        )
+    return keys
+
+
+def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    try:
+        host = alloc_pinned_tensor(*t.shape, dtype=t.dtype)
+    except RuntimeError as exc:
+        raise PinFailed(
+            f"cudaHostAlloc refused {t.nbytes / 2**20:.0f} MiB for {key} (--embed-weights host); "
+            "free host RAM or serve with --embed-weights gpu"
+        ) from exc
+    host.copy_(t)
+    return host
+
+
 def _make_dummy_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     *,
     device: torch.device,
+    host_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -364,6 +399,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
+        if key in host_keys:
+            state_dict[key] = _pinned_copy(key, state_dict[key])
     return state_dict
 
 
@@ -397,6 +434,7 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    host_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -406,6 +444,8 @@ def _materialize_loaded_weight_state_dict(
             if key.endswith(".input_scale"):
                 continue
             state_dict[key] = weight.to(device=device)
+        elif key in host_keys:
+            state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -465,7 +505,6 @@ class Engine:
                 # before the residency snapshot, so streamed blocks are not charged as resident weights
                 self.model.place_encoder_weights(config.mm.encoder_weights)
         # before the residency snapshot, so the freed table goes to the KV pool
-        embed_host_bytes = self._move_embeddings_to_host() if config.embed_device == "cpu" else 0
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -477,10 +516,13 @@ class Engine:
         self.moe_offload_cache = None
         self.elastic_kv = None
         self.cpu_moe_executor = None
-        # Host-side auxiliary stores (qwen4_exp's pinned PLE table, the --embed-device cpu table above): after the weights so a
+        # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = embed_host_bytes
+        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
+        self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
+        if host_embeds:
+            logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
@@ -661,31 +703,17 @@ class Engine:
         resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
+        host_keys = _host_embedding_keys(self.model, config)
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
 
-    def _move_embeddings_to_host(self) -> int:
-        from freetoken.layers.embedding import move_input_embeddings_to_host
-
-        moved_bytes, moved = move_input_embeddings_to_host(self.model)
-        if moved:
-            logger.info_rank0(
-                f"--embed-device cpu: {', '.join(moved)} in pinned host RAM ({mem_GB(moved_bytes)})"
-            )
-        else:
-            logger.warning_rank0(
-                "--embed-device cpu: no untied input embedding to move (tied to the LM head or a "
-                "quantized table); it stays on the GPU"
-            )
-        return moved_bytes
-
-    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -698,6 +726,7 @@ class Engine:
                 include_vision=bool(config.active_encoders) and not config.mm.encoder_out_of_process,
             ),
             device=self.device,
+            host_keys=host_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -964,20 +993,18 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-        if _locked_fetch_wanted(config) and not 1 <= config.moe_locked_max_fetch <= config.model_config.num_experts:
-            raise ValueError(
-                f"--moe-locked-max-fetch {config.moe_locked_max_fetch} must be in [1, {config.model_config.num_experts}] (the experts of a layer)"
-            )
-        # --moe-cpu-layers auto without a manual pin budget: load unpinned, pin the staging, then pin layers until the driver refuses (host_banks.probe_pin)
-        probe = _pin_probe_enabled(config, layer_methods)
+        check_locked_fetch_config(config)
+        # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
+        # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
+        probe = pin_probe_enabled(config, mixed_formats=layer_methods is not None) and _cpu_moe_executor_viable(config.model_config)
         if probe:
             from freetoken.moe.host_banks import HostResidency
 
             requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
-            reserved = self._host_tables_bytes + _locked_staging_estimate(config, method, layer_methods)
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method, all_methods=offload_layer_methods(self.model))
+            reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
+            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
             _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
             requested_residency = None
@@ -1008,20 +1035,16 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        self._locked_staging = None
+        banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency)
         if probe:
-            banks, cpu_layer_ids = self._probe_pins(config, banks, num_moe_layers)
+            cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        elif split_residency and _locked_fetch_wanted(config):
-            self._locked_staging = self._alloc_locked_staging(config, banks)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
-        locked_fetch = split_residency and self._locked_staging is not None
-        layer_tags = banks.layer_tags
-        if locked_fetch:
-            layer_tags = [(t, "locked") if i in cpu_layer_ids else t for i, t in enumerate(layer_tags or [None] * num_moe_layers)]
+        locked_fetch = staging is not None
+        layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
         self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
@@ -1137,58 +1160,11 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
-        if cache.locked_hybrid:
-            from freetoken.moe.locked_fetch import LockedLayerFetch
-
-            locked = sorted(cache.locked_hybrid)
-            cache.locked_fetch = LockedLayerFetch(
-                cache, locked, self._locked_fetch_plan(config, locked), config.moe_locked_max_fetch, cache.cpu_executor, staging=self._locked_staging
-            )
+        if locked_fetch:
+            attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
         return cache
-
-    def _probe_pins(self, config: EngineConfig, banks, num_moe_layers: int):
-        """Pin the locked-layer staging first, then the banks middle-out until a pin fails; the rest are OS-locked."""
-        import dataclasses
-        import time
-
-        from freetoken.moe.host_banks import HostResidency, probe_pin
-
-        plan = banks.deferred_plan
-        if plan is None:
-            return banks, frozenset()  # the loader settled the banks itself (pinned)
-        if _locked_fetch_wanted(config):
-            self._locked_staging = self._alloc_locked_staging(config, banks)
-        # a pin quota filled to the brim fails later device allocations under WDDM (WSL and native Windows)
-        wddm = sys.platform == "win32" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower())
-        margin = int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if wddm else "0")) * 2**30)
-        t0 = time.perf_counter()
-        labels = probe_pin(plan, num_moe_layers, margin)
-        locked = frozenset(i for i, r in enumerate(labels) if r != HostResidency.PINNED.value)
-        if not locked and self._locked_staging:
-            from freetoken.moe.host_banks import refund_pin
-
-            refund_pin(sum(t.numel() for t in self._locked_staging.values()))
-            self._locked_staging = None  # every layer pinned: no copier
-        pinned_bytes = sum(b.nbytes for l, bs in plan.deferred.items() if l not in locked for b in bs)
-        logger.info_rank0(
-            f"--moe-cpu-layers auto (pin probe): pinned {num_moe_layers - len(locked)} MoE layers ({pinned_bytes / 2**30:.2f} GiB) "
-            f"in {time.perf_counter() - t0:.1f}s, locked {len(locked)} {sorted(locked)}"
-            + (f", staging {sum(t.numel() for t in self._locked_staging.values()) / 2**20:.1f} MiB pinned first" if self._locked_staging else "")
-        )
-        return dataclasses.replace(banks, layer_residency=labels, deferred_plan=None), locked
-
-    def _alloc_locked_staging(self, config: EngineConfig, banks) -> dict | None:
-        """The locked-layer staging, pinned before the cache is planned; None (locked layers stay CPU-only) when it cannot be pinned."""
-        from freetoken.moe.locked_fetch import alloc_staging, staging_bytes
-
-        sizes = staging_bytes(banks.sources, config.moe_locked_max_fetch)
-        try:
-            return alloc_staging(sizes)
-        except (PinFailed, RuntimeError) as exc:
-            logger.warning_rank0(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); locked layers decode on the CPU only")
-            return None
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1260,7 +1236,8 @@ class Engine:
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
-        groups = collections.Counter(zip(labels, fractions))
+        # locked layers fetch the fetch_plan share instead; their own log line lists it
+        groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
         if fetched:
             logger.info_rank0(
@@ -1297,26 +1274,6 @@ class Engine:
             keys.append(layer_kind_key(fmt, opts, c.hidden, c.local_intermediate, c.top_k, self.cpu_moe_executor.num_threads))
             labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
         return keys, labels, rows
-
-    def _locked_fetch_plan(self, config: EngineConfig, layers: list[int]) -> dict[int, tuple[int, float]]:
-        """(max_fetch, fraction) per locked layer: --moe-locked-fetch, or auto from each layer's `ft bench bw` row (a fixed cap of 1 without one)."""
-        if config.moe_locked_fetch > 0:
-            logger.info_rank0(f"--moe-locked-fetch {config.moe_locked_fetch:g}: locked layers fetch this share of each step's misses")
-            return {layer: (0, config.moe_locked_fetch) for layer in layers}
-        from freetoken.moe.bench_profile import locked_fetch_fraction
-
-        layer_rows = self._profile_layer_rows()
-        keys, labels, rows = layer_rows if layer_rows is not None else ([None] * (max(layers) + 1), [""] * (max(layers) + 1), {})
-        fractions = {layer: locked_fetch_fraction(rows.get(keys[layer])) for layer in layers}
-        groups = collections.Counter((labels[layer], f) for layer, f in fractions.items())
-        if fetched := [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]:
-            logger.info_rank0(f"--moe-locked-fetch auto: locked layers fetch this share of each step's misses (benched p / (2p + c)): {'; '.join(fetched)}")
-        if capped := [layer for layer, f in fractions.items() if f is None]:
-            logger.warning_rank0(
-                f"--moe-locked-fetch auto: no `ft bench bw` row for locked layers {capped}; they fetch at most 1 expert per step. "
-                "`ft bench bw --model <checkpoint>` benches each layer kind"
-            )
-        return {layer: (0, f) if f is not None else (1, 0.0) for layer, f in fractions.items()}
 
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
@@ -2127,7 +2084,6 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
-    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "moe_preseed": False,

@@ -54,10 +54,10 @@ def _copy_layer_major_track_state(pool, layer, batch) -> None:
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
-    from .gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet
 
     g = config.linear_attention_group()
-    return Qwen4ExpGatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
         num_v_heads=g.num_value_heads,

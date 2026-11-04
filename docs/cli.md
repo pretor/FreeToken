@@ -107,7 +107,7 @@ trade-offs:
 
 ### MoE offload
 
-See [models.md](models.md#moe-strategies) for what each strategy does, and [performance/prefill.md](performance/prefill.md) for prefill speed.
+See [models.md](models.md#moe-strategies) for what each strategy does, [performance/prefill.md](performance/prefill.md) for prefill speed, and [performance/decode.md](performance/decode.md) for decode speed.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -132,11 +132,11 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
 | `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
-| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a GGUF target needs one; the `nextn` MTP blocks llama.cpp writes are not read; a separate checkpoint folder is read with the target's quantization config |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft |
 
-Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` also refuses Qwen3.5 / Qwen3.6 GGUF targets and an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors.
+Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
 ### API behaviour
 
@@ -146,16 +146,22 @@ Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
 
-Every chat completion, completion and Responses response also carries a llama.cpp-shaped
-`timings` object next to `usage` (`prompt_n`, `prompt_ms`, `prompt_per_second`,
-`predicted_n`, `predicted_ms`, `predicted_per_second`, `cache_n`), so frontends like
-llama-swap and Open Web UI show per-request prefill/decode rates and the prefix-cache hit.
-Its spans match the cumulative timing on `GET /v1/stats`: prefill runs from request start
-to the first output token, decode between output tokens. `cache_n` follows llama.cpp
-(always present, `prompt_n` counts only the evaluated tokens) and is not gated by
-`--enable-cache-report`, which controls only `usage.prompt_tokens_details.cached_tokens`.
+With `--enable-timings-report` every chat completion, completion and Responses response
+also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
+`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
+extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
+like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
+measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
+`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
+`predicted_ms` the first to the last committed token; `prompt_n` counts only the
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
+streams the object rides the final chunk; a multi-prompt `/v1/completions` request
+reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+(llama.cpp emits no timings there either).
 
 ### Image input
 

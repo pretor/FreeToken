@@ -34,6 +34,15 @@ _MAX_KV_SPLITS = 64
 _STAGE2_TILE_ELEMS = 8192
 
 
+def _kv_offset_dtype(k_cache: torch.Tensor, v_cache: torch.Tensor):
+    # Bound physical offsets, not request lengths.
+    max_offset = max(
+        sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))
+        for cache in (k_cache, v_cache)
+    )
+    return tl.int32 if max_offset < 1 << 31 else tl.int64
+
+
 def _stage2_launch(max_kv_splits: int, block_dv: int) -> tuple[int, int]:
     """(splits merged per step, num_warps) for stage 2; the tile is at most the split cap rounded up to a power of two."""
     tile = min(triton.next_power_of_2(max_kv_splits), max(4, _STAGE2_TILE_ELEMS // block_dv), 64)
@@ -126,6 +135,7 @@ def _paged_attention_kernel(
     SLIDING_WINDOW: tl.constexpr,
     HAS_SINKS: tl.constexpr,
     HAS_KV_SCALE: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     q_tok = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -164,7 +174,7 @@ def _paged_attention_kernel(
 
         skip_tile = tl.max(mask_n.to(tl.int32), axis=0) == 0
         if not skip_tile:
-            slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0)
+            slots = tl.load(indices_ptr + kv_start + offs_n, mask=offs_n < kv_len, other=0).to(KV_OFFSET_DTYPE)
             if HAS_KV_SCALE:
                 # fp8 KV: the codes carry magnitude, the per-(token, head) fp32 scale
                 # restores it. Index math stays int32 like the 16-bit path below.
@@ -281,6 +291,7 @@ def _decode_grouped_stage1_kernel(
     DV: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
     HAS_KV_SCALE: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
@@ -335,7 +346,7 @@ def _decode_grouped_stage1_kernel(
             rel_offs = rel_start + tl.arange(0, BLOCK_N)
             mask_n = rel_offs < split_end
             logical_offs = effective_start + rel_offs
-            slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0)
+            slots = tl.load(indices_ptr + kv_start + logical_offs, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
 
             if HAS_KV_SCALE:
                 s_k = _kv_dequant_scale(k_scale_ptr, slots, stride_kss, kv_head, mask_n)
@@ -598,6 +609,7 @@ def decode_paged_attention(
         attn_lse.stride(0),
         attn_lse.stride(1),
         attn_lse.stride(2),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         GROUP=group,
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
@@ -680,6 +692,7 @@ def _extend_attention_kernel(
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
     HAS_KV_SCALE: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -738,7 +751,7 @@ def _extend_attention_kernel(
 
         skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
         if not skip_tile:
-            slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
+            slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
             if HAS_KV_SCALE:
                 s_k = _kv_dequant_scale(k_scale_ptr, slots, stride_kss, kv_head, mask_n)
                 k = _kv_load_s16(
@@ -904,6 +917,7 @@ def _extend_attention_split_kernel(
     HAS_SINKS: tl.constexpr,
     HAS_BLOCKS: tl.constexpr,
     HAS_KV_SCALE: tl.constexpr,
+    KV_OFFSET_DTYPE: tl.constexpr,
 ):
     seq_id = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -952,7 +966,7 @@ def _extend_attention_split_kernel(
         prefix_len + block_start, prefix_end // BLOCK_N * BLOCK_N, prefix_end, BLOCK_M, BLOCK_N, SLIDING_WINDOW
     )
     for start_n in tl.range(u0, u1, BLOCK_N):
-        slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n)
+        slots = tl.load(kv_indices_ptr + kv_start + start_n + offs_n).to(KV_OFFSET_DTYPE)
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
             offs_d, offs_dv, mask_d, mask_dv, None, None, False,
@@ -967,7 +981,7 @@ def _extend_attention_split_kernel(
         final_mask = mask_n[None, :]
         if SLIDING_WINDOW > 0:
             final_mask = final_mask & ((kv_offsets[None, :] + SLIDING_WINDOW) > q_abs_pos[:, None])
-        slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0)
+        slots = tl.load(kv_indices_ptr + kv_start + kv_offsets, mask=mask_n, other=0).to(KV_OFFSET_DTYPE)
         m_i, l_i, acc = _extend_attend_tile(
             q, m_i, l_i, acc, qk_scale, kc_base, vc_base, slots * stride_kcs, slots * stride_vcs,
             offs_d, offs_dv, mask_d, mask_dv, mask_n, final_mask, True,
@@ -1123,6 +1137,7 @@ def extend_paged_attention(
             v_scale_arg.stride(0),
             o.stride(0),
             o.stride(1),
+            KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
             GROUP=num_q_heads // num_kv_heads,
             D=head_dim,
             BLOCK_D=block_d,
@@ -1162,6 +1177,7 @@ def extend_paged_attention(
         v_scale_arg.stride(0),
         o.stride(0),
         o.stride(1),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,
@@ -1251,6 +1267,7 @@ def paged_attention(
         v_scale_arg.stride(0),
         o.stride(0),
         o.stride(1),
+        KV_OFFSET_DTYPE=_kv_offset_dtype(k_cache, v_cache),
         GROUP=num_q_heads // num_kv_heads,
         D=head_dim,
         BLOCK_D=block_d,

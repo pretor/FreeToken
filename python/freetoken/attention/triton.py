@@ -144,8 +144,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         v_cache = v_raw.view(-1, kv_heads, head_dim)
         # An fp8 KV pool hands us its per-(token, head) scales; a 16-bit pool returns
         # None and every kernel below keeps its original (scale-free) code path.
-        k_scale = self.kvcache.k_scale(layer_id)
-        v_scale = self.kvcache.v_scale(layer_id)
+        k_scale = self.kvcache.k_scale(layer_id) if hasattr(self.kvcache, "k_scale") else None
+        v_scale = self.kvcache.v_scale(layer_id) if hasattr(self.kvcache, "v_scale") else None
         assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
 
         spec = attn_spec or AttentionSpec()

@@ -54,7 +54,10 @@ def test_each_verify_row_counts_the_drafts_before_it_as_committed():
     logits = torch.randn(drafts.shape[1] + 1, vocab, device=device)
     args = BatchSamplingArgs(temperatures=None, penalties=[(0, counts, presence, frequency)])
 
-    tokens = _sampler(device, vocab).sample_verify(logits, args, drafts)
+    sampler = _sampler(device, vocab)
+    tokens = sampler.sample_verify(logits, args, drafts)
+    sampled = BatchSamplingArgs(temperatures=torch.ones(1, device=device), penalties=args.penalties)
+    probs = sampler.probs(logits, sampled, drafts)
 
     for j in range(drafts.shape[1] + 1):
         seen = counts.clone()
@@ -62,6 +65,8 @@ def test_each_verify_row_counts_the_drafts_before_it_as_committed():
             seen[d] += 1
         expected = logits[j] - frequency * seen - presence * (seen > 0)
         assert int(tokens[j]) == int(expected.argmax()), f"row {j}"
+        # the sparse-q verify reads the same penalized rows
+        assert torch.allclose(probs[j], torch.softmax(expected, dim=-1), atol=1e-6), f"row {j}"
     assert counts[9] == 2 and counts.sum() == 2
 
 
@@ -87,3 +92,48 @@ def test_each_verify_row_samples_with_its_requests_params():
     off_argmax = torch.stack(off_argmax)
     assert not off_argmax[:, 0].any() and not off_argmax[:, 2].any()
     assert off_argmax[:, 1].any(dim=0).all()
+
+
+@cuda
+def test_sparse_q_rejection_commits_the_target_distribution():
+    """Drafts drawn from a q over K candidates per slot, in a batch that mixes rows trusting q, rows whose q is unusable and greedy rows: the token committed at each position still follows the target p on both sampled kinds, and a greedy row commits the argmax prefix (Monte Carlo, k=2, V=6, K=3)."""
+    from freetoken.engine.sample import BatchSamplingArgs
+    from freetoken.spec.rejection import sparse_q_rejection
+
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    vocab, K, k, n = 6, 3, 2, 6_000_000
+    p = torch.softmax(torch.randn(k + 1, vocab, device=device) * 1.5, dim=-1)
+    cand = torch.tensor([[0, 2, 5], [1, 2, 3]], device=device)
+    q = torch.softmax(torch.randn(k, K, device=device), dim=-1)
+    picks = torch.stack([torch.multinomial(q[j], n, replacement=True) for j in range(k)], dim=1)
+    drafts = cand.gather(1, picks.T).T
+    # rows cycle through: q trusted, q unusable (a NaN or a total of 2), greedy
+    kind = torch.arange(n, device=device) % 3
+    q_rows = q.expand(n, k, K).clone()
+    unusable = (kind == 1).nonzero().squeeze(1)
+    q_rows[unusable[::2], 0, 0] = float("nan")
+    q_rows[unusable[1::2], 0] *= 2
+    # softmax(log p) at T=1 hands the verify exactly p on every row
+    logits = p.log().repeat(n, 1)
+    args = BatchSamplingArgs(temperatures=torch.ones(n, device=device), greedy_mask=kind == 2)
+    out, emitted = sparse_q_rejection(logits, drafts, cand.expand(n, k, K).contiguous(), q_rows, args, _sampler(device, vocab))
+
+    def marginal(tokens):
+        return torch.bincount(tokens, minlength=vocab).float() / tokens.numel()
+
+    for rows in (kind == 0, kind == 1):
+        rows_out, rows_emitted = out[rows], emitted[rows]
+        accepted_first = rows_emitted >= 1
+        assert int(accepted_first.sum()) > 100_000
+        assert (marginal(rows_out[:, 0]) - p[0]).abs().max() < 5e-3
+        assert (marginal(rows_out[accepted_first, 1]) - p[1]).abs().max() < 5e-3
+    # both kinds draw the bonus token from p itself; a row that does not trust q rarely accepts every draft
+    accepted_all = (kind < 2) & (emitted == k)
+    assert int(accepted_all.sum()) > 100_000
+    assert (marginal(out[accepted_all, k]) - p[k]).abs().max() < 5e-3
+    greedy = kind == 2
+    argmax = logits[: k + 1].argmax(dim=-1)
+    assert torch.equal(emitted[greedy], (drafts[greedy] == argmax[:k]).cumprod(dim=1).sum(dim=1))
+    committed = torch.arange(k + 1, device=device) <= emitted[greedy].unsqueeze(1)
+    assert torch.equal(out[greedy][committed], argmax.expand(int(greedy.sum()), -1)[committed])

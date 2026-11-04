@@ -44,12 +44,8 @@ class Proposer:
 
     @classmethod
     def adjust_config(cls, config, override) -> None:
-        """Raise if this proposer cannot serve the config; the base rejects TP > 1."""
-        if config.tp_info.size > 1:
-            raise ValueError(
-                "speculative decoding needs --tp 1 for now: without a cross-rank agreement on the drafts, "
-                "near-tied draft argmaxes can differ between ranks and the ranks diverge"
-            )
+        """Raise if this proposer cannot serve the config."""
+        pass
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:

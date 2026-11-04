@@ -9,6 +9,7 @@ import torch
 from freetoken.layers import (
     BaseOP,
     LinearColParallelMerged,
+    LinearReplicated,
     LinearRowParallel,
     gelu_and_mul,
     gelu_tanh_and_mul,
@@ -76,27 +77,51 @@ def embed_input_ids(embed_tokens, input_ids: torch.Tensor, batch: Batch) -> torc
 
 
 class GatedMLP(BaseOP):
-    def __init__(self, config: ModelConfig, *, quant_config: QuantConfig | None = None, prefix: str = ""):
-        self.gate_up_proj = LinearColParallelMerged(
-            config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
-            has_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
+    def __init__(
+        self,
+        config: ModelConfig,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
+        replicated: bool = False,
+    ):
+        if replicated:
+            self.gate_up_proj = LinearReplicated(
+                config.hidden_size,
+                2 * config.intermediate_size,
+                has_bias=False,
+                output_sizes=[config.intermediate_size, config.intermediate_size],
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
+            self.down_proj = LinearReplicated(
+                config.intermediate_size,
+                config.hidden_size,
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+            )
+        else:
+            self.gate_up_proj = LinearColParallelMerged(
+                config.hidden_size,
+                [config.intermediate_size, config.intermediate_size],
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up_proj",
+            )
+            self.down_proj = LinearRowParallel(
+                config.intermediate_size,
+                config.hidden_size,
+                has_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.down_proj",
+            )
 
         fn_map = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
         act_fn = fn_map.get(config.hidden_act, None)
         if act_fn is None:
             raise ValueError(f"Unsupported activation function: {config.hidden_act}")
         self.act_fn = act_fn
-        self.down_proj = LinearRowParallel(
-            config.intermediate_size,
-            config.hidden_size,
-            has_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -20,6 +20,9 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -40,6 +43,19 @@ class TorchDistributedImpl(DistributedImpl):
         dist.all_gather_into_tensor(out, x)
         return out
 
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return x
+        backend = dist.get_backend()
+        if x.is_cuda and backend == "gloo":
+            cpu_t = x.cpu()
+            dist.broadcast(cpu_t, src=src)
+            x.copy_(cpu_t)
+        else:
+            dist.broadcast(x, src=src)
+        return x
+
+
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
@@ -59,6 +75,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
         self.comm.all_gather(result, x)
         return result
 
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.broadcast(x, src=src)
+        return x
+
+
 
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
@@ -68,6 +90,10 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        return self.plugins[-1].broadcast(x, src=src)
+
 
 
 def enable_pynccl_distributed(

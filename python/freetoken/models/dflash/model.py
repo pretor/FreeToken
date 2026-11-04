@@ -54,11 +54,12 @@ class _GroupedConv(BaseOP):
 class _Attention(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.q_size = config.num_heads * config.head_dim
-        self.qkv_proj = LinearQKVMerged(
-            config.hidden_size, config.head_dim, config.num_heads, config.num_kv_heads, has_bias=False,
+        self.qkv_proj = LinearReplicated(
+            config.hidden_size, (config.num_heads + 2 * config.num_kv_heads) * config.head_dim, has_bias=False,
+            output_sizes=[config.num_heads * config.head_dim, config.num_kv_heads * config.head_dim, config.num_kv_heads * config.head_dim],
             quant_config=quant_config, prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = LinearRowParallel(self.q_size, config.hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.o_proj")
+        self.o_proj = LinearReplicated(self.q_size, config.hidden_size, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.o_proj")
         self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
@@ -66,7 +67,7 @@ class _Attention(BaseOP):
 class _Layer(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.self_attn = _Attention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
-        self.mlp = GatedMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = GatedMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp", replicated=True)
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         conv = dict(taps=config.conv_kernel_size, group_size=config.conv_group_size, quant_config=quant_config)

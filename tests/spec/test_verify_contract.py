@@ -105,10 +105,10 @@ def tap_next_layer_inputs(model):
         cls, by_id = type(layers[0]), {id(layers[i + 1]): i for i in TAPS}
         original = cls.forward
 
-        def wrapped(self, hidden, batch):
+        def wrapped(self, hidden, batch, *args, **kwargs):
             if (i := by_id.get(id(self))) is not None:
                 taps_ref[i][: hidden.shape[0], : hidden.shape[1]].copy_(hidden)
-            return original(self, hidden, batch)
+            return original(self, hidden, batch, *args, **kwargs)
 
     cls.forward = wrapped
 

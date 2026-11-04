@@ -76,7 +76,14 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
     def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
-        if dist.is_initialized() and dist.get_world_size() > 1:
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return x
+        backend = dist.get_backend()
+        if x.is_cuda and backend == "gloo":
+            cpu_t = x.cpu()
+            dist.broadcast(cpu_t, src=src)
+            x.copy_(cpu_t)
+        else:
             dist.broadcast(x, src=src)
         return x
 

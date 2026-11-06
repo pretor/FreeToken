@@ -865,6 +865,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, _min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         per_expert = expert_bytes_per_slot(banks.sources)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts

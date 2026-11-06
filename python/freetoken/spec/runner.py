@@ -92,12 +92,7 @@ class SpecRunner:
         self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         if self.config.tp_info.size > 1:
             from freetoken.distributed import DistributedCommunicator
-            comm = DistributedCommunicator()
-            comm.broadcast(self._proposal.tokens, src=0)
-            if self._proposal.cand is not None:
-                comm.broadcast(self._proposal.cand, src=0)
-            if self._proposal.q is not None:
-                comm.broadcast(self._proposal.q, src=0)
+            DistributedCommunicator().broadcast(self._proposal.tokens, src=0)
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
         token_pool[rows.unsqueeze(1), cols] = self._proposal.tokens.to(token_pool.dtype)
 
@@ -108,18 +103,21 @@ class SpecRunner:
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
-        proposal = self._proposal
-        if proposal.q is not None:
-            out, emitted = sparse_q_rejection(logits, drafts, proposal.cand, proposal.q, sample_args, engine.sampler)
+        if self.config.tp_info.is_primary():
+            proposal = self._proposal
+            if proposal.q is not None:
+                out, emitted = sparse_q_rejection(logits, drafts, proposal.cand, proposal.q, sample_args, engine.sampler)
+            else:
+                out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+            combined = torch.cat([out, emitted.unsqueeze(1)], dim=1)
         else:
-            out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+            combined = torch.empty((bs, width + 1), dtype=torch.int64, device=self.device)
         if self.config.tp_info.size > 1:
             from freetoken.distributed import DistributedCommunicator
-            comm = DistributedCommunicator()
-            comm.broadcast(out, src=0)
-            comm.broadcast(emitted, src=0)
+            DistributedCommunicator().broadcast(combined, src=0)
+        out, emitted = combined[:, :width], combined[:, width]
         host = self._host[:bs]
-        host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
+        host.copy_(combined, non_blocking=True)
         copy_done = torch.cuda.Event()
         copy_done.record(engine.stream)
         # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it

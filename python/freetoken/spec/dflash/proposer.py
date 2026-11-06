@@ -50,8 +50,25 @@ class _PrefillSink:
     def final_hidden(self, x: torch.Tensor) -> None:
         pass
 
-    def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
+    def layer_output(self, layer_id: int, x: torch.Tensor | List[torch.Tensor], residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         self.got.add(layer_id)
+        if isinstance(x, list):
+            assert residual is None and len(self.spans) == 1
+            m = self.spans[0][2]
+            if x[-1].shape[0] >= m:
+                rows = x[-1][-m:]
+            else:
+                tail: List[torch.Tensor] = []
+                rem = m
+                for chunk in reversed(x):
+                    take = min(rem, chunk.shape[0])
+                    tail.append(chunk[-take:])
+                    rem -= take
+                    if rem == 0:
+                        break
+                rows = torch.cat(list(reversed(tail)), dim=0)
+            _write_tap(self.aux, self.cols[layer_id], rows, None, num_streams, self.hidden)
+            return
         kept = None if residual is None else residual.index_select(0, self.rows_idx)
         _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), kept, num_streams, self.hidden)
 

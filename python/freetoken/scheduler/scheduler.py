@@ -867,13 +867,11 @@ class Scheduler(SchedulerIOMixin):
     def _kv_seq_limit(self) -> int:
         """Admission ceiling: the elastic max when it is configured, otherwise the live pool."""
         ek = getattr(self.engine, "elastic_kv", None)
-        if ek is None:
-            return self.engine.max_seq_len
-        return ek.max_tokens
+        limit = self.engine.max_seq_len if ek is None else ek.max_tokens
+        return limit - self.prefill_manager.token_headroom
 
-    @staticmethod
-    def _aligned_kv_need(input_len: int, max_tokens: int, page_size: int) -> int:
-        return div_ceil(input_len + max_tokens, page_size) * page_size
+    def _aligned_kv_need(self, input_len: int, max_tokens: int, page_size: int) -> int:
+        return div_ceil(input_len + max_tokens + self.prefill_manager.token_headroom, page_size) * page_size
 
     def _maybe_grow_kv(self) -> None:
         """When idle, grow the KV pool to cover the parked requests and shrink the MoE cache.
@@ -896,6 +894,8 @@ class Scheduler(SchedulerIOMixin):
         current = self.engine.num_pages * ek.page_size
         target = elastic_grow_tokens(current, needs, ek.max_tokens)
         if target is not None:
+            step = div_ceil(32_768, ek.page_size) * ek.page_size
+            target = min(ek.max_tokens, max(target, current + step))
             # Layer-major (<=32k) also keeps a fixed scratch reserve. Longer prompts only
             # pay for the extra KV pages, which is how 14500 slots served a 200k pool.
             activation_tokens = max(len(msg.input_ids) for msg in self._kv_wait)

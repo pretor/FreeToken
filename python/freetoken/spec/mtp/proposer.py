@@ -84,8 +84,8 @@ class _PrefillSink:
         self.spans = spans
         self.hidden: torch.Tensor | None = None
 
-    def final_hidden(self, x: torch.Tensor) -> None:
-        self.hidden = x
+    def final_hidden(self, x: torch.Tensor | List[torch.Tensor]) -> None:
+        self.hidden = torch.cat(x, dim=0) if isinstance(x, list) else x
 
     def layer_output(self, layer_id: int, x: torch.Tensor, residual: torch.Tensor | None = None, num_streams: int = 1) -> None:
         pass

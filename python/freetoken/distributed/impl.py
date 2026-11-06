@@ -76,6 +76,20 @@ class PyNCCLDistributedImpl(DistributedImpl):
         return result
 
     def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        from .info import get_tp_info
+
+        world_size = get_tp_info().size
+        if world_size <= 1:
+            return x
+        if x.is_cuda and x.nbytes > 0 and x.nbytes % 2 == 0:
+            contig = x if x.is_contiguous() else x.contiguous()
+            as_bf16 = contig.view(torch.uint8).view(-1).view(torch.bfloat16)
+            gathered = as_bf16.new_empty((world_size * as_bf16.numel(),))
+            self.comm.all_gather(gathered, as_bf16)
+            as_bf16.copy_(gathered.view(world_size, -1)[src])
+            if contig is not x:
+                x.copy_(contig)
+            return x
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return x
         backend = dist.get_backend()

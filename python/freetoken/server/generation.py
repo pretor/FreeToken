@@ -280,10 +280,17 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             fn = dict(tc.get("function") or {})
             arguments = fn.get("arguments")
             if isinstance(arguments, str):
-                try:
-                    fn["arguments"] = json.loads(arguments)
-                except json.JSONDecodeError:
-                    pass
+                if arguments.strip():
+                    try:
+                        parsed = json.loads(arguments)
+                        arguments = parsed if isinstance(parsed, dict) else {}
+                    except json.JSONDecodeError:
+                        arguments = {}
+                else:
+                    arguments = {}
+            elif not isinstance(arguments, dict):
+                arguments = {}
+            fn["arguments"] = arguments
             tc["function"] = fn
             rendered.append(tc)
         m["tool_calls"] = rendered

@@ -81,21 +81,23 @@ class GatedMLP(BaseOP):
         self,
         config: ModelConfig,
         *,
+        intermediate_size: int | None = None,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
         replicated: bool = False,
     ):
+        intermediate_size = intermediate_size or config.intermediate_size
         if replicated:
             self.gate_up_proj = LinearReplicated(
                 config.hidden_size,
-                2 * config.intermediate_size,
+                2 * intermediate_size,
                 has_bias=False,
-                output_sizes=[config.intermediate_size, config.intermediate_size],
+                output_sizes=[intermediate_size, intermediate_size],
                 quant_config=quant_config,
                 prefix=f"{prefix}.gate_up_proj",
             )
             self.down_proj = LinearReplicated(
-                config.intermediate_size,
+                intermediate_size,
                 config.hidden_size,
                 has_bias=False,
                 quant_config=quant_config,
@@ -104,13 +106,13 @@ class GatedMLP(BaseOP):
         else:
             self.gate_up_proj = LinearColParallelMerged(
                 config.hidden_size,
-                [config.intermediate_size, config.intermediate_size],
+                [intermediate_size, intermediate_size],
                 has_bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.gate_up_proj",
             )
             self.down_proj = LinearRowParallel(
-                config.intermediate_size,
+                intermediate_size,
                 config.hidden_size,
                 has_bias=False,
                 quant_config=quant_config,

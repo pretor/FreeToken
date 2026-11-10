@@ -6,11 +6,13 @@ The draft KV holds context rows (target features through ``fc`` and ``hidden_nor
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
 
-from freetoken.kernel.triton.dflash import RingAttention, grouped_conv, norm_rope_store, selector_walk
+from freetoken.kernel.backend import is_flashinfer_installed
+from freetoken.kernel.triton.dflash import grouped_conv, norm_rope_store, ring_attention, ring_attention_workspace, selector_walk
 from freetoken.layers import LinearQKVMerged, LinearReplicated, LinearRowParallel, OPList, RMSNorm, RMSNormFused
 from freetoken.layers.base import BaseOP
 from freetoken.layers.quantization import NoQuantConfig, QuantConfig, finalize_quant
@@ -23,15 +25,16 @@ from .weight import iter_weights
 
 @dataclass
 class DFlashRing:
-    """The draft K/V of one request per table row, position ``p`` at slot ``p % ring``, with the attention and rope table over those positions; built by ``DFlash2DraftModel.make_ring`` and owned by the proposer."""
+    """The draft K/V of one request per table row, position ``p`` at slot ``p % ring_len``, with the attention workspace and rope table for blocks of ``block`` tokens; built by ``DFlash2DraftModel.make_dflash_ring`` and owned by the proposer."""
 
-    k: torch.Tensor  # [layers, rows, ring, kv_heads, head_dim]
+    k: torch.Tensor  # [layers, rows, ring_len, kv_heads, head_dim]
     v: torch.Tensor
-    attention: RingAttention
+    block: int
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     cos_sin: torch.Tensor  # [max_position, head_dim] fp32
 
 
-class _GroupedConv(BaseOP):
+class DFlashGroupedConv(BaseOP):
     """Grouped dynamic depthwise 2-tap convolution along the block axis (sglang DFlashGroupedConv)."""
 
     def __init__(self, hidden: int, taps: int, group_size: int, *, quant_config: QuantConfig, prefix: str) -> None:
@@ -51,7 +54,7 @@ class _GroupedConv(BaseOP):
         return grouped_conv(x, coef, self.base_kernel[1], block, self.group_size)
 
 
-class _Attention(BaseOP):
+class DFlashAttention(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.q_size = config.num_heads * config.head_dim
         self.qkv_proj = LinearReplicated(
@@ -64,24 +67,31 @@ class _Attention(BaseOP):
         self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
 
 
-class _Layer(BaseOP):
+class DFlashDecoderLayer(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
-        self.self_attn = _Attention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
+        self.self_attn = DFlashAttention(config, quant_config=quant_config, prefix=f"{prefix}.self_attn")
         self.mlp = GatedMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp", replicated=True)
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         conv = dict(taps=config.conv_kernel_size, group_size=config.conv_group_size, quant_config=quant_config)
-        self.attention_conv = _GroupedConv(config.hidden_size, prefix=f"{prefix}.attention_conv", **conv)
-        self.mlp_conv = _GroupedConv(config.hidden_size, prefix=f"{prefix}.mlp_conv", **conv)
+        self.attention_conv = DFlashGroupedConv(config.hidden_size, prefix=f"{prefix}.attention_conv", **conv)
+        self.mlp_conv = DFlashGroupedConv(config.hidden_size, prefix=f"{prefix}.mlp_conv", **conv)
 
 
-class _CandidateSelector(BaseOP):
+class DFlashCandidateSelector(BaseOP):
     def __init__(self, config: DFlashDraftConfig, *, quant_config: QuantConfig, prefix: str) -> None:
         self.hidden_projection = LinearReplicated(
             config.hidden_size, config.selector_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.hidden_projection",
         )
         self.predecessor_codebook = torch.empty(config.vocab_size, config.selector_rank)
         self.successor_codebook = torch.empty(config.vocab_size, config.selector_rank)
+
+    def sample_path(self, candidate_ids, unary_logits, hidden, anchor, temperature, greedy, uniforms) -> tuple[torch.Tensor, torch.Tensor]:
+        """Walk one path over the ``[bs, k, K]`` candidates: argmax on ``greedy`` rows, else drawn with ``uniforms`` from softmax(scores / temperature); returns the tokens ``[bs, k]`` and the q each was drawn from ``[bs, k, K]``."""
+        return selector_walk(
+            candidate_ids, unary_logits, self.hidden_projection.forward(hidden), anchor,
+            self.predecessor_codebook, self.successor_codebook, temperature, greedy, uniforms,
+        )
 
 
 class DFlash2DraftModel(BaseOP):
@@ -92,12 +102,18 @@ class DFlash2DraftModel(BaseOP):
         hidden, taps = config.hidden_size, len(config.target_layer_ids)
         self.fc = LinearReplicated(taps * hidden, hidden, has_bias=False, quant_config=quant_config, prefix="fc")
         self.hidden_norm = RMSNorm(hidden, config.rms_norm_eps)
-        self.layers = OPList([_Layer(config, quant_config=quant_config, prefix=f"layers.{i}") for i in range(config.num_layers)])
+        self.layers = OPList([DFlashDecoderLayer(config, quant_config=quant_config, prefix=f"layers.{i}") for i in range(config.num_layers)])
         self.norm = RMSNormFused(hidden, config.rms_norm_eps)
-        self.candidate_selector = _CandidateSelector(config, quant_config=quant_config, prefix="candidate_selector")
+        self.candidate_selector = DFlashCandidateSelector(config, quant_config=quant_config, prefix="candidate_selector")
         # the target's own modules; underscore names keep them out of this module's state dict
         self._embed_tokens = target_model.model.embed_tokens
         self._lm_head = target_model.lm_head
+        if is_flashinfer_installed():
+            from flashinfer import top_k
+
+            self._top_k = functools.partial(top_k, sorted=True, deterministic=True)
+        else:
+            self._top_k = functools.partial(torch.topk, dim=-1)
 
     @classmethod
     def load(cls, config: DFlashDraftConfig, target_model, model_path: str, device: torch.device, dtype: torch.dtype) -> DFlash2DraftModel:
@@ -131,19 +147,16 @@ class DFlash2DraftModel(BaseOP):
         draft._mask_embedding = draft._embed_tokens.forward(torch.tensor([config.mask_token_id], device=device))[0]
         return draft
 
-    def make_ring(self, max_rows: int, block: int, ring: int, max_position: int, device: torch.device) -> DFlashRing:
-        """A zeroed ring of ``ring`` positions for ``max_rows`` table rows, drafting blocks of ``block`` tokens at positions below ``max_position``."""
+    def make_dflash_ring(self, max_rows: int, block: int, ring_len: int, max_position: int, device: torch.device) -> DFlashRing:
+        """A zeroed ring of ``ring_len`` positions for ``max_rows`` table rows, drafting blocks of ``block`` tokens at positions below ``max_position``."""
         c = self.config
-        assert ring >= c.window + block, f"a ring of {ring} cannot hold the window {c.window} plus the block {block}"
-        k = torch.zeros(c.num_layers, max_rows, ring, c.num_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
-        attention = RingAttention(
-            max_bs=max_rows, block=block, num_heads=c.num_heads, num_kv_heads=c.num_kv_heads, head_dim=c.head_dim,
-            ring=ring, window=c.window, device=device,
-        )
+        assert ring_len >= c.window + block, f"a ring of {ring_len} cannot hold the window {c.window} plus the block {block}"
+        k = torch.zeros(c.num_layers, max_rows, ring_len, c.num_kv_heads, c.head_dim, dtype=self._kv_all.dtype, device=device)
+        workspace = ring_attention_workspace(max_rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, device)
         # not the cached get_rope: max_position follows the page table, so each rebuild would cache one more table
         inv_freq = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float, device=device) / c.head_dim))
         freqs = torch.arange(max_position, dtype=torch.float, device=device)[:, None] * inv_freq[None, :]
-        return DFlashRing(k, torch.zeros_like(k), attention, torch.cat((freqs.cos(), freqs.sin()), dim=-1))
+        return DFlashRing(k, torch.zeros_like(k), block, workspace, torch.cat((freqs.cos(), freqs.sin()), dim=-1))
 
     # ---------------------------------------------------------------- context KV
 
@@ -151,23 +164,23 @@ class DFlash2DraftModel(BaseOP):
         """Captured target features ``[n, taps*hidden]`` -> the context rows ``[n, hidden]`` the ring and the window hold."""
         return self.hidden_norm.forward(self.fc.forward(features))
 
-    def store_context(self, ctx: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, ring: DFlashRing) -> None:
+    def store_context(self, ctx: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, dflash_ring: DFlashRing) -> None:
         """Every layer's K/V of the context rows into the ring rows ``rows`` at ``positions``, which must be distinct modulo the ring within one call."""
         c, n = self.config, ctx.shape[0]
         kv = torch.empty(n, c.num_layers, self._kv_all.shape[1], dtype=ctx.dtype, device=ctx.device)
         torch.bmm(ctx.expand(c.num_layers, *ctx.shape), self._kv_all.transpose(1, 2), out=kv.transpose(0, 1))
         norm_rope_store(
             kv.view(n, -1), num_layers=c.num_layers, num_q_heads=0, q_out=None, q_norm=None,
-            k_norms=self._k_norms, cos_sin=ring.cos_sin, positions=positions, rows=rows,
-            ring_k=ring.k, ring_v=ring.v, layer0=0, eps=c.rms_norm_eps,
+            k_norms=self._k_norms, cos_sin=dflash_ring.cos_sin, positions=positions, rows=rows,
+            ring_k=dflash_ring.k, ring_v=dflash_ring.v, layer0=0, eps=c.rms_norm_eps,
         )
 
     # ---------------------------------------------------------------- block draft
 
-    def forward_block(self, bonus: torch.Tensor, starts: torch.Tensor, rows: torch.Tensor, ring: DFlashRing) -> torch.Tensor:
+    def forward_block(self, bonus: torch.Tensor, starts: torch.Tensor, rows: torch.Tensor, dflash_ring: DFlashRing) -> torch.Tensor:
         """Final hidden ``[bs*block, hidden]`` of the block ``[bonus, mask x (block-1)]`` at positions ``starts + j`` of ring rows ``rows``."""
         c = self.config
-        bs, block = bonus.shape[0], ring.attention.block
+        bs, block = bonus.shape[0], dflash_ring.block
         x = self._mask_embedding.expand(bs, block, -1).clone()
         x[:, 0] = self._embed_tokens.forward(bonus)
         x = x.view(bs * block, -1)
@@ -183,10 +196,10 @@ class DFlash2DraftModel(BaseOP):
             # the block's own K/V go into the ring, so the attention reads window and block alike
             norm_rope_store(
                 attn.qkv_proj.forward(h), num_layers=1, num_q_heads=c.num_heads, q_out=q, q_norm=attn.q_norm.weight,
-                k_norms=self._k_norms, cos_sin=ring.cos_sin, positions=positions, rows=token_rows,
-                ring_k=ring.k, ring_v=ring.v, layer0=i, eps=c.rms_norm_eps,
+                k_norms=self._k_norms, cos_sin=dflash_ring.cos_sin, positions=positions, rows=token_rows,
+                ring_k=dflash_ring.k, ring_v=dflash_ring.v, layer0=i, eps=c.rms_norm_eps,
             )
-            o = attn.o_proj.forward(ring.attention(q, ring.k, ring.v, i, rows, starts, scale))
+            o = attn.o_proj.forward(ring_attention(q, dflash_ring.k, dflash_ring.v, i, rows, starts, c.window, scale, dflash_ring.workspace))
             o = layer.attention_conv.finish(o, conv, block)
             h, residual = layer.post_attention_layernorm.forward(o, residual)
             h, conv = layer.mlp_conv.prepare(h, block)
@@ -195,34 +208,8 @@ class DFlash2DraftModel(BaseOP):
 
     # ---------------------------------------------------------------- selector
 
-    def candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Top-K token ids ``[n, K]`` and their fp32 logits of the target head over ``hidden [n, hidden]``, best first."""
-        vals, idx = _top_k(self._lm_head.logits(hidden), self.config.selector_top_k)
-        return idx.long(), vals.float()
-
-    def propose(self, hidden: torch.Tensor, anchor: torch.Tensor, temperature: torch.Tensor, greedy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Walk one selector path over the block's draft slots: argmax on ``greedy`` rows, else drawn from softmax(scores / temperature).
-
-        Returns draft tokens ``[bs, k]``, candidate ids ``[bs, k, K]`` and the q each draft was drawn from ``[bs, k, K]``.
-        """
-        bs = anchor.shape[0]
-        pred = hidden.view(bs, -1, self.config.hidden_size)[:, 1:]
-        slots, top_k = pred.shape[1], self.config.selector_top_k
-        ids, unary = self.candidates(pred.reshape(-1, self.config.hidden_size))
-        selector = self.candidate_selector
-        tokens, q = selector_walk(
-            ids.view(bs, slots, top_k), unary.view(bs, slots, top_k), selector.hidden_projection.forward(pred), anchor,
-            selector.predecessor_codebook, selector.successor_codebook, temperature, greedy,
-            torch.rand(bs, slots, device=hidden.device),
-        )
-        return tokens, ids.view(bs, slots, top_k), q
-
-
-def _top_k(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    from freetoken.kernel.backend import is_flashinfer_installed
-
-    if is_flashinfer_installed():
-        from flashinfer import top_k
-
-        return top_k(logits, k, sorted=True, deterministic=True)
-    return torch.topk(logits, k, dim=-1)
+    def compute_candidates(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The target head's top-K token ids and their fp32 logits over ``hidden [..., H]``, best first, so a tie in the walk takes the first."""
+        vals, ids = self._top_k(self._lm_head.logits(hidden.reshape(-1, hidden.shape[-1])), self.config.selector_top_k)
+        shape = hidden.shape[:-1] + (-1,)
+        return ids.long().view(shape), vals.float().view(shape)

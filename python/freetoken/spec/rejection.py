@@ -28,11 +28,11 @@ def reject(
     return target, emitted
 
 
-def sparse_q_rejection(
+def reject_with_draft_probs(
     logits: torch.Tensor,   # [bs*(k+1), V]
     drafts: torch.Tensor,   # [bs, k] int64, slot j drawn from q[:, j]
-    cand: torch.Tensor,     # [bs, k, K] the support of q
-    q: torch.Tensor,        # [bs, k, K] q over cand
+    support: torch.Tensor,  # [bs, k, K] the token ids where q can be nonzero
+    q: torch.Tensor,        # [bs, k, K] q over support
     args: BatchSamplingArgs,
     sampler: Sampler,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -52,7 +52,7 @@ def sparse_q_rejection(
     d = drafts.unsqueeze(-1)
     p_d = p[:, :k].gather(2, d).squeeze(-1)
     # a row without a usable q verifies with q one-hot at its draft, which is ``reject``: accept with p(d), else sample p without d; a greedy row's p is one-hot at its argmax
-    q_d = torch.where(ok.view(-1, 1), (q * (cand == d)).sum(dim=-1), 1.0)
+    q_d = torch.where(ok.view(-1, 1), (q * (support == d)).sum(dim=-1), 1.0)
     accept = torch.rand_like(p_d) * q_d < p_d
     emitted = accept.to(torch.int64).cumprod(dim=1).sum(dim=1)
     rows = torch.arange(bs, device=p.device)
@@ -60,7 +60,7 @@ def sparse_q_rejection(
     rejected = (emitted < k).view(-1, 1)
     # the residual max(0, p - q) at the first rejected slot; the bonus row is p itself
     pick = p[rows, emitted]
-    pick.scatter_add_(1, cand[rows, slot], -q[rows, slot] * rejected)
+    pick.scatter_add_(1, support[rows, slot], -q[rows, slot] * rejected)
     pick.scatter_add_(1, drafts[rows, slot].view(-1, 1), -(rejected & ~ok.view(-1, 1)).float())
     pick.clamp_(min=0.0)
     total = pick.sum(dim=-1, keepdim=True)

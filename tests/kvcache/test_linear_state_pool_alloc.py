@@ -118,6 +118,8 @@ def test_layerless_spec_dtype_and_fill_value():
     pool = _pool(num_slots=6, slot_states=(spec,))
     t = pool.slot_state("ngram")
     assert t.shape == (6, 2) and t.dtype is torch.int32 and bool((t == 7).all())
+    # one int32 [2] per slot, not one per linear layer, and the budget counts the same
+    assert pool.bytes_per_slot() == linear_state_bytes_per_req(_group(), 1, torch.bfloat16, (spec,)) == _pool().bytes_per_slot() + 2 * 4
     t[3] = 1
     pool.clear_slots([3])
     assert bool((pool.slot_state("ngram")[3] == 7).all())

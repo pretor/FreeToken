@@ -177,64 +177,46 @@ class _Reference:
 @pytest.mark.parametrize("dtype, tol", [(torch.float32, 2**-6), (torch.bfloat16, 2**-2)])
 @pytest.mark.parametrize("block", [4, 8])
 def test_block_forward_matches_reference(tmp_path, block, dtype, tol):
-    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 draft pins the math (tf32 dots); the bf16 draft, the serving dtype, is held to bf16 noise."""
+    """Two requests in one block forward: one with a context shorter than the window (positions before 0 masked), one longer than the ring (wrapped slots). The fp32 draft pins the math (tf32 dots); the bf16 draft, the serving dtype, is held to bf16 noise. A ring rebuilt from only the window rows gives the same hidden, bitwise."""
     w = _weights()
     draft, ref = _load_draft(tmp_path, w, dtype), _Reference(w)
-    ring = draft.make_ring(max_rows=3, block=block, ring=RING, max_position=4096, device=DEV)
+    dflash_ring = draft.make_dflash_ring(max_rows=3, block=block, ring_len=RING, max_position=4096, device=DEV)
     torch.manual_seed(1)
     lengths, rows = (5, 100), (2, 1)
-    contexts = []
+    contexts, draft_contexts = [], []
     for n, row in zip(lengths, rows):
         features = torch.randn(n, len(TAPS) * H, device=DEV, dtype=torch.bfloat16).to(dtype)
         ctx = draft.context_rows(features)
         torch.testing.assert_close(ctx.float(), ref.context_rows(features), atol=0, rtol=2**-6)
+        draft_contexts.append(ctx)
         # as the proposer stores a chunk: its last RING rows at most
         tail = torch.arange(max(0, n - RING), n, device=DEV)
-        draft.store_context(ctx[tail], tail, torch.full((len(tail),), row, device=DEV), ring)
+        draft.store_context(ctx[tail], tail, torch.full((len(tail),), row, device=DEV), dflash_ring)
         contexts.append(ref.context_rows(features))
         for i in range(LAYERS):
             k, v = ref.kv(i, contexts[-1][tail], tail)
-            torch.testing.assert_close(ring.k[i, row, tail % RING].float(), k, atol=2**-6, rtol=2**-6)
-            torch.testing.assert_close(ring.v[i, row, tail % RING].float(), v, atol=2**-6, rtol=2**-6)
+            torch.testing.assert_close(dflash_ring.k[i, row, tail % RING].float(), k, atol=2**-6, rtol=2**-6)
+            torch.testing.assert_close(dflash_ring.v[i, row, tail % RING].float(), v, atol=2**-6, rtol=2**-6)
     bonus = torch.tensor([3, 40], device=DEV)
     starts, rows_t = torch.tensor(lengths, device=DEV), torch.tensor(rows, device=DEV)
 
-    hidden = draft.forward_block(bonus, starts, rows_t, ring)
+    hidden = draft.forward_block(bonus, starts, rows_t, dflash_ring)
 
     assert hidden.shape == (2 * block, H) and hidden.dtype == dtype
     for b in range(2):
         want = ref.block(int(bonus[b]), lengths[b], contexts[b], block)
         torch.testing.assert_close(hidden[b * block : (b + 1) * block].float(), want, atol=tol, rtol=tol)
 
-
-def test_ring_rebuilt_from_the_window_rows_drafts_the_same(tmp_path):
-    """Storing only the context rows of positions ``[start-WINDOW+1, start)`` into a zeroed ring gives the hidden the full history gave, bitwise: a restore from the window loses nothing, and the block reads nothing older."""
-    w = _weights()
-    draft = _load_draft(tmp_path, w)
-    block, n, row = 4, 100, 1
-    ring = draft.make_ring(max_rows=2, block=block, ring=RING, max_position=4096, device=DEV)
-    torch.manual_seed(2)
-    ctx = draft.context_rows(torch.randn(n, len(TAPS) * H, device=DEV, dtype=torch.bfloat16))
-    positions, rows = torch.arange(n, device=DEV), torch.full((n,), row, device=DEV)
-    bonus, starts, rows_t = torch.tensor([7], device=DEV), torch.tensor([n], device=DEV), torch.tensor([row], device=DEV)
-    draft.store_context(ctx[-RING:], positions[-RING:], rows[-RING:], ring)
-    full = draft.forward_block(bonus, starts, rows_t, ring)
-
-    ring.k.zero_()
-    ring.v.zero_()
-    lo = n - WINDOW + 1
-    draft.store_context(ctx[lo:], positions[lo:], rows[lo:], ring)
-    restored = draft.forward_block(bonus, starts, rows_t, ring)
-
-    assert torch.equal(restored, full)
-    # one row short, and the first query of the block loses a key
-    ring.k.zero_()
-    ring.v.zero_()
-    draft.store_context(ctx[lo + 1 :], positions[lo + 1 :], rows[lo + 1 :], ring)
-    assert not torch.equal(draft.forward_block(bonus, starts, rows_t, ring)[0], full[0])
+    # a restore from the window loses nothing, and the block reads nothing older
+    dflash_ring.k.zero_()
+    dflash_ring.v.zero_()
+    for n, row, ctx in zip(lengths, rows, draft_contexts):
+        window = torch.arange(max(0, n - WINDOW + 1), n, device=DEV)
+        draft.store_context(ctx[window], window, torch.full((len(window),), row, device=DEV), dflash_ring)
+    torch.testing.assert_close(draft.forward_block(bonus, starts, rows_t, dflash_ring), hidden, atol=tol, rtol=tol)
 
 
-def test_propose_walks_the_selector_lattice(tmp_path):
+def test_sample_path_walks_the_selector_lattice(tmp_path):
     """Greedy and sampled requests follow the fp32 walk (same uniforms); a request whose scores all tie takes the first candidate; a NaN hidden yields in-range ids and a q that is no distribution, without disturbing the other requests."""
     w = _weights()
     draft, ref = _load_draft(tmp_path, w), _Reference(w)
@@ -247,10 +229,10 @@ def test_propose_walks_the_selector_lattice(tmp_path):
     temperature = torch.tensor([1.0, 0.7, 1.0, 0.7], device=DEV)
     greedy = torch.tensor([True, False, True, False], device=DEV)
 
-    torch.manual_seed(5)
-    tokens, cand, q = draft.propose(hidden, anchor, temperature, greedy)
-    torch.manual_seed(5)
+    pred = hidden.view(bs, block, H)[:, 1:]
+    cand, unary = draft.compute_candidates(pred)
     uniforms = torch.rand(bs, block - 1, device=DEV)
+    tokens, q = draft.candidate_selector.sample_path(cand, unary, pred, anchor, temperature, greedy, uniforms)
     want_tokens, want_q = ref.walk(hidden[: 2 * block], cand[:2], anchor[:2], temperature[:2], greedy[:2], uniforms[:2])
 
     assert tokens.shape == (bs, block - 1) and cand.shape == q.shape == (bs, block - 1, TOP_K)

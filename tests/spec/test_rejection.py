@@ -65,40 +65,54 @@ def test_each_verify_row_counts_the_drafts_before_it_as_committed():
             seen[d] += 1
         expected = logits[j] - frequency * seen - presence * (seen > 0)
         assert int(tokens[j]) == int(expected.argmax()), f"row {j}"
-        # the sparse-q verify reads the same penalized rows
+        # the verify with draft probs reads the same penalized rows
         assert torch.allclose(probs[j], torch.softmax(expected, dim=-1), atol=1e-6), f"row {j}"
     assert counts[9] == 2 and counts.sum() == 2
 
 
 @cuda
 def test_each_verify_row_samples_with_its_requests_params():
-    """Request i's sampling params cover its k+1 verify rows: a top_k=1 request and a greedy one give the argmax on every row, a full-vocab one does not."""
+    """Request i's sampling params cover its k+1 verify rows: a top_k=1 request and a greedy one give the argmax on every row, a sampled one does not; the draft-probs verify reads each row's softmax at its request's temperature, renormalized over its top-k and then its top-p."""
     from freetoken.engine.sample import BatchSamplingArgs
 
     device = torch.device("cuda")
     torch.manual_seed(2)
-    vocab, k, trials = 32, 2, 16
+    vocab, k, trials, bs = 32, 2, 16, 4
     args = BatchSamplingArgs(
-        temperatures=torch.ones(3, device=device),
-        top_k=torch.tensor([1, vocab, vocab], dtype=torch.int32, device=device),
-        greedy_mask=torch.tensor([False, False, True], device=device),
+        temperatures=torch.tensor([1.0, 1.3, 1.0, 0.7], device=device),
+        top_k=torch.tensor([1, vocab, vocab, 6], dtype=torch.int32, device=device),
+        top_p=torch.tensor([1.0, 0.9, 1.0, 0.8], device=device),
+        greedy_mask=torch.tensor([False, False, True, False], device=device),
     )
-    drafts = torch.zeros(3, k, dtype=torch.int64, device=device)
+    drafts = torch.zeros(bs, k, dtype=torch.int64, device=device)
     off_argmax = []
     for _ in range(trials):
-        logits = 0.1 * torch.randn(3 * (k + 1), vocab, device=device)
+        logits = 0.1 * torch.randn(bs * (k + 1), vocab, device=device)
         tokens = _sampler(device, vocab).sample_verify(logits, args, drafts)
-        off_argmax.append((tokens != logits.argmax(dim=-1)).view(3, k + 1))
+        off_argmax.append((tokens != logits.argmax(dim=-1)).view(bs, k + 1))
     off_argmax = torch.stack(off_argmax)
     assert not off_argmax[:, 0].any() and not off_argmax[:, 2].any()
     assert off_argmax[:, 1].any(dim=0).all()
 
+    logits = torch.randn(bs * (k + 1), vocab, device=device)
+    probs = _sampler(device, vocab).probs(logits, args, drafts)
+    for row, i in enumerate(torch.arange(bs).repeat_interleave(k + 1).tolist()):
+        want = torch.softmax(logits[row] / args.temperatures[i], dim=-1)
+        want = torch.where(want >= want.topk(int(args.top_k[i])).values[-1], want, 0.0)
+        # top-p keeps the smallest best-first set whose mass reaches top_p
+        p_sorted, order = (want / want.sum()).sort(descending=True)
+        p_sorted = torch.where(p_sorted.cumsum(0) - p_sorted < args.top_p[i], p_sorted, 0.0)
+        want = torch.zeros_like(want).scatter(0, order, p_sorted / p_sorted.sum())
+        if args.greedy_mask[i]:
+            want = torch.nn.functional.one_hot(logits[row].argmax(), vocab).float()
+        torch.testing.assert_close(probs[row], want, atol=1e-6, rtol=1e-5, msg=f"row {row}")
+
 
 @cuda
-def test_sparse_q_rejection_commits_the_target_distribution():
+def test_reject_with_draft_probs_commits_the_target_distribution():
     """Drafts drawn from a q over K candidates per slot, in a batch that mixes rows trusting q, rows whose q is unusable and greedy rows: the token committed at each position still follows the target p on both sampled kinds, and a greedy row commits the argmax prefix (Monte Carlo, k=2, V=6, K=3)."""
     from freetoken.engine.sample import BatchSamplingArgs
-    from freetoken.spec.rejection import sparse_q_rejection
+    from freetoken.spec.rejection import reject_with_draft_probs
 
     device = torch.device("cuda")
     torch.manual_seed(2)
@@ -117,7 +131,7 @@ def test_sparse_q_rejection_commits_the_target_distribution():
     # softmax(log p) at T=1 hands the verify exactly p on every row
     logits = p.log().repeat(n, 1)
     args = BatchSamplingArgs(temperatures=torch.ones(n, device=device), greedy_mask=kind == 2)
-    out, emitted = sparse_q_rejection(logits, drafts, cand.expand(n, k, K).contiguous(), q_rows, args, _sampler(device, vocab))
+    out, emitted = reject_with_draft_probs(logits, drafts, cand.expand(n, k, K).contiguous(), q_rows, args, _sampler(device, vocab))
 
     def marginal(tokens):
         return torch.bincount(tokens, minlength=vocab).float() / tokens.numel()

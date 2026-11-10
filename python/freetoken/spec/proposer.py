@@ -21,6 +21,14 @@ def check_draft_path(path: str) -> None:
         raise ValueError(f"--speculative-draft-model-path {path} does not exist")
 
 
+class SpecProposal(NamedTuple):
+    """One step's drafts and, when they were sampled, the distribution each was drawn from, kept on its support; None when the drafts are argmaxes."""
+
+    draft_token_ids: torch.Tensor                       # [bs, k] int64 target-vocab ids
+    draft_support_ids: torch.Tensor | None = None       # [bs, k, K] the token ids where q can be nonzero
+    draft_support_probs: torch.Tensor | None = None     # [bs, k, K] fp32 q over them, summing to 1
+
+
 class DraftContext(NamedTuple):
     """Built by SpecRunner.attach; the only engine state the draft side gets. A rebuild replaces it."""
 
@@ -37,8 +45,6 @@ class DraftContext(NamedTuple):
 class Proposer:
     """Draft side of one speculative method; holds no engine reference."""
 
-    default_k: ClassVar[int]
-    max_k: ClassVar[int]
     # True: the draft's KV slot i depends on token i+1, so the prefix cache keys position i by (t_i, t_{i+1})
     radix_lookahead: ClassVar[bool] = False
 
@@ -50,7 +56,7 @@ class Proposer:
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
         """(default, max) draft tokens per step; called after ``adjust_config``."""
-        return cls.default_k, cls.max_k
+        raise NotImplementedError
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]:

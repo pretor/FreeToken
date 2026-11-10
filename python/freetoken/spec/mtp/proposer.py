@@ -10,9 +10,8 @@ import torch
 
 from freetoken.core import Batch, get_global_ctx
 from freetoken.engine.sample import make_device_tensor
-from freetoken.engine.spec_protocol import SpecProposal
 from freetoken.models.blocks import embed_input_ids
-from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.spec.mtp.relay import HiddenRelay
 
 if TYPE_CHECKING:
@@ -107,9 +106,11 @@ class _VerifySink:
 
 
 class MTPProposer(Proposer):
-    default_k = 3
-    max_k = 8
     radix_lookahead = True
+
+    @classmethod
+    def num_steps(cls, config) -> tuple[int, int]:
+        return 3, 8
 
     @classmethod
     def adjust_config(cls, config, override) -> None:

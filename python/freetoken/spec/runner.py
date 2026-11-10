@@ -9,8 +9,8 @@ import torch
 from freetoken.engine.sample import make_device_tensor
 from freetoken.engine.spec_protocol import SpecForwardOutput
 
-from .proposer import DraftContext, Proposer
-from .rejection import reject, sparse_q_rejection
+from .proposer import DraftContext, Proposer, SpecProposal
+from .rejection import reject, reject_with_draft_probs
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
@@ -92,9 +92,9 @@ class SpecRunner:
         self._proposal = self.proposer.propose(reqs, rows, token_pool[rows, cols])
         if self.config.tp_info.size > 1:
             from freetoken.distributed import DistributedCommunicator
-            DistributedCommunicator().broadcast(self._proposal.tokens, src=0)
+            DistributedCommunicator().broadcast(self._proposal.draft_token_ids, src=0)
         cols = cols.unsqueeze(1) + 1 + torch.arange(self.k, device=self.device)
-        token_pool[rows.unsqueeze(1), cols] = self._proposal.tokens.to(token_pool.dtype)
+        token_pool[rows.unsqueeze(1), cols] = self._proposal.draft_token_ids.to(token_pool.dtype)
 
     def verify_step(self, batch: Batch, sample_args: BatchSamplingArgs) -> SpecForwardOutput:
         engine = self.engine
@@ -103,10 +103,12 @@ class SpecRunner:
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
         batch.features = self.feature_sink(batch)
         logits = engine.forward_logits(batch)[: bs * width]
+        proposal, self._proposal = self._proposal, None
         if self.config.tp_info.is_primary():
-            proposal = self._proposal
-            if proposal.q is not None:
-                out, emitted = sparse_q_rejection(logits, drafts, proposal.cand, proposal.q, sample_args, engine.sampler)
+            if proposal.draft_support_probs is not None:
+                out, emitted = reject_with_draft_probs(
+                    logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
+                )
             else:
                 out, emitted = reject(logits, drafts, sample_args, engine.sampler)
             combined = torch.cat([out, emitted.unsqueeze(1)], dim=1)

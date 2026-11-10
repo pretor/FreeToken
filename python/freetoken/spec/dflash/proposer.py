@@ -11,10 +11,9 @@ import torch
 
 from freetoken.attention.linear import gdn_slot
 from freetoken.engine.sample import make_device_tensor
-from freetoken.engine.spec_protocol import SpecProposal
-from freetoken.kernel.triton.dflash import RingAttention
+from freetoken.kernel.triton.dflash import ring_attention_workspace
 from freetoken.spec.dflash.window import DFlashWindow
-from freetoken.spec.proposer import DraftContext, Proposer, check_draft_path
+from freetoken.spec.proposer import DraftContext, Proposer, SpecProposal, check_draft_path
 from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
@@ -38,7 +37,7 @@ def _write_tap(dst: torch.Tensor, col: int, x: torch.Tensor, residual: torch.Ten
         torch.add(x, residual, out=out)
 
 
-class _PrefillSink:
+class DFlashPrefillSink:
     """The tapped layers' outputs of each request's last ``m`` chunk rows, side by side in one feature block; ``spans`` holds each request's (cached_len, device_len, m) when the batch was formed."""
 
     def __init__(self, taps: tuple[int, ...], rows_idx: torch.Tensor, aux: torch.Tensor, hidden: int, spans: List[tuple[int, int, int]]) -> None:
@@ -73,7 +72,7 @@ class _PrefillSink:
         _write_tap(self.aux, self.cols[layer_id], x.index_select(0, self.rows_idx), kept, num_streams, self.hidden)
 
 
-class _VerifySink:
+class DFlashVerifySink:
     """Every verify row's tapped outputs into the persistent feature buffer, so a captured verify graph writes it too."""
 
     def __init__(self, taps: tuple[int, ...], buffer: torch.Tensor, hidden: int) -> None:
@@ -142,9 +141,9 @@ class DFlashProposer(Proposer):
     def budget(cls, config) -> tuple[int, int]:
         c = cls._draft_config(config)
         block, rows, item = config.speculative_num_steps + 1, config.max_running_req + 1, config.dtype.itemsize
-        ring = DFlashWindow.length(c.window, block)
-        kv = 2 * c.num_layers * rows * ring * c.num_kv_heads * c.head_dim * item
-        scratch = RingAttention.scratch_bytes(max_bs=rows, block=block, num_heads=c.num_heads, num_kv_heads=c.num_kv_heads, head_dim=c.head_dim, ring=ring)
+        ring_len = DFlashWindow.length(c.window, block)
+        kv = 2 * c.num_layers * rows * ring_len * c.num_kv_heads * c.head_dim * item
+        scratch = sum(t.nbytes for t in ring_attention_workspace(rows, block, c.num_heads, c.num_kv_heads, c.head_dim, ring_len, torch.device("meta")))
         aux = config.max_running_req * block * len(c.target_layer_ids) * c.hidden_size * item
         # the rope table is sized by the page table at attach; max_seq_len bounds its width
         rope = config.max_seq_len * c.head_dim * 4
@@ -171,8 +170,8 @@ class DFlashProposer(Proposer):
         self.taps, self.hidden, self.block = c.target_layer_ids, c.hidden_size, self.k + 1
         self.ring_len = DFlashWindow.length(c.window, self.block)
         self._seen: Dict[int, int] = {}  # table row -> uid of the request whose chunks its ring holds
-        self._prefill_sink: _PrefillSink | None = None
-        self.ring = self.window = self.aux_buf = None
+        self._prefill_sink: DFlashPrefillSink | None = None
+        self.dflash_ring = self.window = self.aux_buf = None
         self._graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self._inject_graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         params = sum(t.numel() for t in self.draft.state_dict().values())
@@ -186,14 +185,14 @@ class DFlashProposer(Proposer):
     def attach(self, ctx: DraftContext) -> None:
         super().attach(ctx)
         mr = self.config.max_running_req
-        self.ring = self.draft.make_ring(mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device)
+        self.dflash_ring = self.draft.make_dflash_ring(mr + 1, self.block, self.ring_len, ctx.page_table.shape[1], ctx.device)
         self.window = DFlashWindow(ctx.slot_states, self.ring_len, self.hidden) if DFlashWindow.NAME in ctx.slot_states else None
         self.aux_buf = torch.zeros(mr * self.block, len(self.taps) * self.hidden, dtype=self.dtype, device=ctx.device)
 
     def detach(self, *, keep_kv: bool) -> None:
         # the ring is keyed by table row and position, not by KV slot, and a rebuild finds no request running
         self._graphs, self._inject_graphs = {}, {}
-        self.ring = self.window = self.aux_buf = None
+        self.dflash_ring = self.window = self.aux_buf = None
         self._seen.clear()
         super().detach(keep_kv=keep_kv)
 
@@ -202,14 +201,19 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ draft step
 
-    def _draft(self, bonus, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden = self.draft.forward_block(bonus, starts, rows, self.ring)
-        return self.draft.propose(hidden, bonus, temperature, greedy)
+    def _draft(self, pending, starts, rows, temperature, greedy) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden = self.draft.forward_block(pending, starts, rows, self.dflash_ring)
+        # row 0 of each block is the pending token; rows 1..k predict the drafts
+        pred = hidden.view(pending.shape[0], self.block, -1)[:, 1:]
+        candidate_ids, unary_logits = self.draft.compute_candidates(pred)
+        uniforms = torch.rand(pred.shape[:2], device=pred.device)
+        tokens, q = self.draft.candidate_selector.sample_path(candidate_ids, unary_logits, pred, pending, temperature, greedy, uniforms)
+        return tokens, candidate_ids, q
 
     def _inject(self, features: torch.Tensor, positions: torch.Tensor, rows: torch.Tensor, slots: torch.Tensor | None) -> None:
         """The context rows of ``features`` into the ring rows ``rows`` and the window slots ``slots`` at ``positions``."""
         ctx = self.draft.context_rows(features)
-        self.draft.store_context(ctx, positions, rows, self.ring)
+        self.draft.store_context(ctx, positions, rows, self.dflash_ring)
         if self.window is not None:
             self.window.write(ctx, positions, slots)
 
@@ -288,9 +292,9 @@ class DFlashProposer(Proposer):
 
     # ------------------------------------------------------------------ target features
 
-    def feature_sink(self, batch: Batch) -> _PrefillSink | _VerifySink:
+    def feature_sink(self, batch: Batch) -> DFlashPrefillSink | DFlashVerifySink:
         if batch.phase == "verify":
-            return _VerifySink(self.taps, self.aux_buf, self.hidden)
+            return DFlashVerifySink(self.taps, self.aux_buf, self.hidden)
         # a later block reads at most the ring's length of rows behind it
         idx, spans, off = [], [], 0
         for req in batch.reqs:
@@ -300,7 +304,7 @@ class DFlashProposer(Proposer):
             spans.append((s, e, m))
             off += e - s
         aux = torch.empty(len(idx), len(self.taps) * self.hidden, dtype=self.dtype, device=self.device)
-        self._prefill_sink = _PrefillSink(self.taps, make_device_tensor(idx, torch.int64, self.device), aux, self.hidden, spans)
+        self._prefill_sink = DFlashPrefillSink(self.taps, make_device_tensor(idx, torch.int64, self.device), aux, self.hidden, spans)
         return self._prefill_sink
 
     def post_verify(self, batch: Batch, out: torch.Tensor, emitted: torch.Tensor) -> None:
@@ -348,10 +352,10 @@ class DFlashProposer(Proposer):
                 torch.cat([window.read(slot, lo, hi - lo) for slot, lo, hi, _ in restore]),
                 make_device_tensor([p for _, lo, hi, _ in restore for p in range(lo, hi)], torch.int32, self.device),
                 make_device_tensor([row for _, lo, hi, row in restore for _ in range(lo, hi)], torch.int64, self.device),
-                self.ring,
+                self.dflash_ring,
             )
         positions = make_device_tensor(pos, torch.int32, self.device)
-        self.draft.store_context(ctx, positions, make_device_tensor(rows, torch.int64, self.device), self.ring)
+        self.draft.store_context(ctx, positions, make_device_tensor(rows, torch.int64, self.device), self.dflash_ring)
         if window is None:
             return
         window.write(ctx, positions, make_device_tensor(slots, torch.int64, self.device))

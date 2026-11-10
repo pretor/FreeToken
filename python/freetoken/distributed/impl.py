@@ -62,20 +62,26 @@ class PyNCCLDistributedImpl(DistributedImpl):
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_reduce(x, "sum")
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        import tvm_ffi
         from .info import get_tp_info
 
         world_size = get_tp_info().size
         output_shape = list(x.shape)
         output_shape[0] *= world_size
         result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_gather(result, x)
         return result
 
     def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        import tvm_ffi
         from .info import get_tp_info
 
         world_size = get_tp_info().size
@@ -85,7 +91,8 @@ class PyNCCLDistributedImpl(DistributedImpl):
             contig = x if x.is_contiguous() else x.contiguous()
             as_bf16 = contig.view(torch.uint8).view(-1).view(torch.bfloat16)
             gathered = as_bf16.new_empty((world_size * as_bf16.numel(),))
-            self.comm.all_gather(gathered, as_bf16)
+            with tvm_ffi.use_torch_stream():
+                self.comm.all_gather(gathered, as_bf16)
             as_bf16.copy_(gathered.view(world_size, -1)[src])
             if contig is not x:
                 x.copy_(contig)

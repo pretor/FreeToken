@@ -1666,7 +1666,18 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self.config.tp_info.is_primary():
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        else:
+            next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
+        if self.config.tp_info.size > 1:
+            from freetoken.distributed import DistributedCommunicator
+            DistributedCommunicator().broadcast(next_tokens_gpu, src=0)
+        if not self.config.tp_info.is_primary() and args.penalties:
+            for row, counts, _, _ in args.penalties:
+                counts.scatter_add_(
+                    0, next_tokens_gpu[row : row + 1].long(), counts.new_ones(1)
+                )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

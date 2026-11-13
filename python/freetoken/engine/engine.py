@@ -6,7 +6,6 @@ import errno
 import gc
 import math
 import os
-import sys
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -19,8 +18,9 @@ from freetoken.gpu_select import gpu_identity
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
+from freetoken.layers.quantization.names import name_set
 from freetoken.moe.offload_cache import iter_offload_moe_layers
-from freetoken.mm.config import ENCODER_SECTIONS, check_cpu_encoder_support
+from freetoken.mm.config import ENCODER_SECTIONS
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
@@ -36,6 +36,7 @@ from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
+from freetoken.kvcache.format import NONE, KVFormat
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
@@ -148,9 +149,9 @@ def _required_attn_types(model_config) -> frozenset[AttnType]:
     return types or frozenset({AttnType.FULL})
 
 
-def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
+def _backend_parts_serve(name: str, required: frozenset[AttnType], kv_format: KVFormat = NONE) -> bool:
     return all(
-        required <= attention_backend_info(part).supported_types
+        required <= attention_backend_info(part).supported_types and kv_format.name in attention_backend_info(part).kv_formats
         for part in name.split(",")
     )
 
@@ -168,38 +169,10 @@ def _backend_requirements_met(name: str) -> bool:
     return True
 
 
-# --kv-cache-dtype spellings -> the stored EngineConfig.kv_quant value.
-KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8"}
-
-
-def _resolve_kv_quant(value: str | None) -> str:
-    """Normalize a --kv-cache-dtype spelling to EngineConfig.kv_quant."""
-    key = (value or "auto").strip().lower()
-    if key not in KV_QUANT_ALIASES:
-        raise ValueError(
-            f"unknown --kv-cache-dtype {value!r}; expected one of "
-            f"{', '.join(sorted(KV_QUANT_ALIASES))}"
-        )
-    return KV_QUANT_ALIASES[key]
-
-
-def _backend_supports_kv_quant(name: str, kv_quant: str) -> bool:
-    """Whether every comma part of an attention-backend string can read a quantized
-    KV pool (an unquantized pool needs nothing from the backend)."""
-    if kv_quant == "none":
-        return True
-    return all(
-        attention_backend_info(part.strip()).supports_fp8_kv for part in name.split(",")
-    )
-
-
-def _resolve_auto_attention_backend(
-    required: frozenset[AttnType], *, kv_quant: str = "none"
-) -> str:
+def _resolve_auto_attention_backend(required: frozenset[AttnType], kv_format: KVFormat = NONE) -> str:
     """First candidate (in per-type priority order) whose arch condition holds,
-    whose packages are installed, whose every comma part serves ALL required
-    types, and which can decode a quantized KV cache when one is configured.
-    Reproduces the historical hardware tree for FULL-only models:
+    whose packages are installed, and whose every comma part serves ALL required
+    types. Reproduces the historical hardware tree for FULL-only models:
     sm_100 -> trtllm, sm_90+sgl_kernel -> "fa,fi", flashinfer -> fi, else triton."""
     candidates: list[tuple[str, bool]] = []
     if AttnType.DSV4 in required:
@@ -224,22 +197,14 @@ def _resolve_auto_attention_backend(
     for name, arch_ok in candidates:
         if not arch_ok:
             continue
-        if not _backend_parts_serve(name, required):
+        if not _backend_parts_serve(name, required, kv_format):
             continue
         if not _backend_requirements_met(name):
-            continue
-        if not _backend_supports_kv_quant(name, kv_quant):
             continue
         return name
     raise RuntimeError(
         "No attention backend can serve attention types "
-        f"{sorted(t.value for t in required)} on this machine"
-        + (
-            f" with a {kv_quant} KV cache"
-            if kv_quant != "none"
-            else ""
-        )
-        + "."
+        f"{sorted(t.value for t in required)} with KV format {kv_format.name} on this machine."
     )
 
 
@@ -255,7 +220,7 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
     runner = _spec_runner()
     runner.adjust_config(config, override)
     override("spec_slot_states", runner.slot_states(config))
-    if windowed_kv:
+    if windowed_kv and not runner.target_may_be_windowed(config):
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
             "their window frees would release slots a verify step still reads"
@@ -274,6 +239,19 @@ def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
             f"speculative decoding needs a decode attention backend that captures multi-row graphs "
             f"(fa, triton or fi), got {config.attention_backend!r}"
         )
+
+
+def _validate_kv_format(config, model_config) -> None:
+    kv_format = getattr(config, "kv_format", NONE)
+    if not kv_format.quantized:
+        return
+    pool_cls = resolve_pool_class(model_config)
+    if kv_format.name not in pool_cls.kv_formats:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name}: {pool_cls.__name__} only stores {sorted(pool_cls.kv_formats)}")
+    if config.dtype != torch.bfloat16:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} needs --dtype bfloat16, got {config.dtype}")
+    if config.tp_info.size != 1:
+        raise ValueError(f"--kv-cache-dtype {kv_format.name} does not support tensor parallelism yet")
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -310,6 +288,12 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"attention, which backend {part!r} does not support; valid backends: "
                 f"{', '.join(valid)} (or auto), got {config.attention_backend!r}."
             )
+        kv_format = getattr(config, "kv_format", NONE)
+        if kv_format.name not in info.kv_formats:
+            raise ValueError(
+                f"--kv-cache-dtype {kv_format.name}: backend {part!r} cannot read that format, "
+                f"got {config.attention_backend!r}."
+            )
         if AttnType.SWA in required and not info.consumes_attn_spec:
             # SWA models drive window/sinks/sm_scale through the per-call AttentionSpec;
             # a backend that drops it would attend with the wrong window silently.
@@ -317,23 +301,6 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"backend {part!r} does not consume the per-call AttentionSpec that "
                 f"SWA models require, got {config.attention_backend!r}."
             )
-
-    # A quantized KV pool is only readable by a backend that applies its per-(token,
-    # head) scales; one that hands the cache to an external kernel would silently
-    # attend to raw e4m3 codes. Rejected here, before any weight is resident.
-    kv_quant = getattr(config, "kv_quant", "none")
-    if not _backend_supports_kv_quant(config.attention_backend, kv_quant):
-        fp8_backends = [
-            name
-            for name in ("trtllm", "fi", "fa", "triton")
-            if required <= attention_backend_info(name).supported_types
-            and attention_backend_info(name).supports_fp8_kv
-        ]
-        raise ValueError(
-            f"--kv-cache-dtype {kv_quant} needs an attention backend that decodes the KV "
-            f"scales; {config.attention_backend!r} does not. Valid for this model: "
-            f"{', '.join(fp8_backends) or 'none'} (or use --kv-cache-dtype bf16)."
-        )
 
     # An explicitly-selected backend may require a package that isn't installed. Auto
     # never resolves to one of these when its package is missing, so this only fires for
@@ -398,7 +365,9 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
         return frozenset()
     # a tied LM head reads its whole table every step, so that table stays on the GPU
     tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied}
+    tables = {
+        id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied and not op.quant_method.online
+    }
     keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys and tied:
         raise ValueError(
@@ -407,10 +376,33 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
         )
     if not keys:
         raise ValueError(
-            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
-            "on the GPU); serve it with --embed-weights gpu"
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (an --online-quant "
+            "table stays on the GPU); serve it with --embed-weights gpu"
         )
     return keys
+
+
+def _online_quant_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the bf16 weights an online quant method converts in finalize; they load to host RAM so the GPU holds one of them at a time."""
+    if not config.online_quant:
+        return frozenset()
+    to_checkpoint = config.model_config.quant.name_map.to_checkpoint
+    ops = [op for op in iter_ops(model) if getattr(op, "quant_method", None) is not None and op.quant_method.online]
+    names = [name for op in ops for name in to_checkpoint(op.prefix)]
+    missed = [p for p in config.online_quant_modules if not any(map(name_set((p,)), names))]
+    if missed:
+        example = to_checkpoint(next(op.prefix for op in iter_ops(model) if getattr(op, "prefix", "")))[0]
+        raise ValueError(
+            f"--online-quant-modules: no layer --online-quant {config.online_quant} converts matches {', '.join(missed)}; "
+            f"give the checkpoint's module names, e.g. {example!r}"
+        )
+    if not ops:
+        raise ValueError(
+            f"--online-quant {config.online_quant}: {config.model_path} has no layer it converts; the checkpoint quantizes "
+            "its Linear layers and tables, or they must stay as stored"
+        )
+    weights = {id(op.weight) for op in ops}
+    return frozenset(key for key, t in model.state_dict().items() if id(t) in weights)
 
 
 def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
@@ -432,6 +424,7 @@ def _make_dummy_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -456,6 +449,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
         if key in host_keys:
             state_dict[key] = _pinned_copy(key, state_dict[key])
+        elif key in staged_keys:
+            state_dict[key] = state_dict[key].cpu()
     return state_dict
 
 
@@ -490,6 +485,7 @@ def _materialize_loaded_weight_state_dict(
     *,
     device: torch.device,
     host_keys: frozenset[str] = frozenset(),
+    staged_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -501,6 +497,8 @@ def _materialize_loaded_weight_state_dict(
             state_dict[key] = weight.to(device=device)
         elif key in host_keys:
             state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
+        elif key in staged_keys:
+            state_dict[key] = weight.to(device="cpu", dtype=expected.dtype)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -543,8 +541,6 @@ class Engine:
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
-        if config.active_encoders and config.mm.encoder_out_of_process:
-            check_cpu_encoder_support(config.model_spec.mm_processor)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
@@ -556,9 +552,8 @@ class Engine:
                     f"{type(self.model).__name__} has encoders registered but lacks the SupportsMultimodal hooks; "
                     "run with --text-model-only"
                 )
-            if not config.mm.encoder_out_of_process:
-                # before the residency snapshot, so streamed blocks are not charged as resident weights
-                self.model.place_encoder_weights(config.mm.encoder_weights)
+            # before the residency snapshot, so streamed blocks are not charged as resident weights
+            self.model.place_encoder_weights(config.mm.encoder_weights)
         # draft weights load before any pool is sized, so every free-memory read below counts them
         self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
@@ -570,12 +565,14 @@ class Engine:
         # graphs, or other processes. Cross-rank MIN, deterministic across ranks.
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
-        self.elastic_kv = None
         self.cpu_moe_executor = None
         # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
+        host_embeds = [
+            op for op in iter_ops(self.model)
+            if type(op) is VocabParallelEmbedding and not op.quant_method.online and not op.weight.is_cuda
+        ]
         self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
         if host_embeds:
             logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
@@ -584,11 +581,6 @@ class Engine:
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
-        if (config.kv_initial_tokens is not None or config.kv_max_tokens is not None) and self.elastic_kv is None:
-            raise RuntimeError(
-                "--kv-initial-tokens and --kv-max-tokens require an offload MoE strategy "
-                "(--moe-strategy offload, hybrid, or cpu)"
-            )
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -599,15 +591,11 @@ class Engine:
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
             self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
-            placement = (
-                "the CPU encoder process" if config.mm.encoder_out_of_process else config.mm.encoder_weights
-            )
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
-                f"{[e.kind for e in config.active_encoders]} on {placement}, serving {sorted(config.served_modalities)}"
+                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
             )
-            if not config.mm.encoder_out_of_process:
-                self._warmup_encoders()
+            self._warmup_encoders()
         elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
             logger.info_rank0(
                 "Multimodal disabled: --text-model-only"
@@ -639,8 +627,6 @@ class Engine:
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
-            # Naive caching has no tree to hang a checkpoint on, so the bank would be dead RAM.
-            host_slots = 0 if config.cache_type == "naive" else config.mamba_host_slots
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
                 num_slots=_linear_pool_num_slots(config),
@@ -648,14 +634,7 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.slot_states,
-                host_slots=host_slots,
             )
-            if host_slots > 1:
-                per_slot = self.linear_state_pool.host_bytes_per_slot()
-                logger.info_rank0(
-                    f"GDN host snapshot bank: {host_slots - 1} pinned host slots x "
-                    f"{mem_GB(per_slot)} = {mem_GB(host_slots * per_slot)} pinned in total (slot 0 "
-                    "is the padding sink; not charged against the GPU cache budget)")
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
@@ -713,13 +692,6 @@ class Engine:
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
 
-        if self.moe_offload_cache is not None:
-            preseed_enabled = (
-                config.moe_preseed if config.moe_preseed is not None else config.moe_prefill_hit_d2d
-            )
-            if preseed_enabled:
-                self.moe_offload_cache.preseed()
-
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
@@ -740,13 +712,10 @@ class Engine:
                 backend="nccl",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
-                timeout=timedelta(seconds=getattr(config, "step_timeout", 120.0)),
+                timeout=timedelta(seconds=config.distributed_timeout),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(
-                backend="gloo",
-                timeout=timedelta(seconds=config.distributed_timeout),
-            )
+            tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
 
@@ -761,16 +730,23 @@ class Engine:
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
         host_keys = _host_embedding_keys(self.model, config)
+        staged_keys = _online_quant_keys(self.model, config)
+        if config.online_quant:
+            logger.info_rank0(f"--online-quant {config.online_quant}: converting {len(staged_keys)} weights at load")
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys, staged_keys))
+        if config.speculative_algorithm is not None:
+            _spec_runner().prepare_target(config, self.model)
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
 
-    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(
+        self, config: EngineConfig, host_keys: frozenset[str], staged_keys: frozenset[str]
+    ) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys, staged_keys=staged_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -780,10 +756,11 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not getattr(config.model_config, "is_moe", False),
-                include_vision=bool(config.active_encoders) and not config.mm.encoder_out_of_process,
+                include_vision=bool(config.active_encoders),
             ),
             device=self.device,
             host_keys=host_keys,
+            staged_keys=staged_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -819,10 +796,7 @@ class Engine:
         for item in jobs:
             if not cache.has(item.hash):
                 if item.precomputed_embeddings is not None:
-                    emb = item.precomputed_embeddings
-                    # the CPU encoder's rows are already in host memory; only device storage needs the upload
-                    if cache.storage == "cuda":
-                        emb = emb.to(self.device, non_blocking=True)
+                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
                 else:
                     emb = self.model.encode(item)
                 cache.put(item.hash, emb)
@@ -835,176 +809,6 @@ class Engine:
             cache.consume(item_hash, uid, hi - lo)
         if parts:
             batch.mm_embeds = torch.cat([p.to(self.dtype) for p in parts], dim=0)
-
-    def _configure_elastic_kv(self, config: EngineConfig, banks, size_cap: int) -> None:
-        """Start the KV pool at --kv-initial-tokens and remember how to grow it to --kv-max-tokens.
-
-        The MoE slot count is whatever of ``size_cap`` still fits beside that KV pin. Later growth
-        replans from the same byte budget (cross-rank min), so every TP rank computes the same
-        geometry. ``--num-tokens`` / ``--moe-cache-size`` do not pin the pool once this is on.
-        """
-        from freetoken.engine.cache_budget import (
-            ElasticKv,
-            expert_bytes_per_slot,
-            max_elastic_tokens,
-            net_cache_budget_bytes,
-            plan_elastic_kv,
-        )
-        from freetoken.utils import div_ceil
-
-        initial = config.kv_initial_tokens
-        requested_max = config.kv_max_tokens
-        if initial is None or requested_max is None:
-            raise ValueError("elastic KV needs both --kv-initial-tokens and --kv-max-tokens")
-        if initial <= 0 or requested_max <= 0:
-            raise ValueError(
-                f"elastic KV sizes must be positive, got initial={initial} max={requested_max}"
-            )
-        if initial > requested_max:
-            raise ValueError(
-                f"--kv-initial-tokens {initial} is above --kv-max-tokens {requested_max}"
-            )
-
-        cache_per_page, fixed_cache_size, page_tokens, _min_reserve = self._pool_cls.kv_cost(config)
-        fixed_cache_size += state_pool_bytes(config)
-        spec_fixed, draft_page = self._spec_budget(config)
-        fixed_cache_size += spec_fixed
-        cache_per_page += draft_page
-        per_expert = expert_bytes_per_slot(banks.sources)
-        num_experts = config.model_config.num_experts
-        total_experts = config.model_config.num_moe_layers * num_experts
-        budget = net_cache_budget_bytes(
-            config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
-        )
-        # Leave about 900 MiB free per 16 GiB card once the process is resident.
-        # 224 MiB of reserve captured graphs at 0.86 GiB and settled near 720 MiB;
-        # 400 MiB of reserve puts the idle free memory on the 900 MiB mark.
-        activation_reserve = 400 * 1024 * 1024
-        if budget <= activation_reserve:
-            raise ValueError(
-                f"elastic KV budget {budget} B is below the {activation_reserve} B activation reserve"
-            )
-        budget -= activation_reserve
-        logger.info_rank0(
-            f"elastic KV budget holds back {activation_reserve / 2**30:.1f} GiB for graphs and prefill"
-        )
-        max_slots = min(size_cap, total_experts)
-        # Rebuild refuses a slot count below the per-pool decode floor (top-k * max running).
-        decode_batch = max(config.max_running_req, 1)
-        pool_floor = sum(p.min_num_slots for p in self._moe_pools(decode_batch))
-        overlap_floor = 2 * num_experts if config.moe_prefill_overlap and max_slots >= 2 * num_experts else num_experts
-        moe_floor = max(pool_floor, overlap_floor)
-        fit = max_elastic_tokens(
-            budget_bytes=budget,
-            per_expert_bytes=per_expert,
-            cache_per_page=cache_per_page,
-            page_size=page_tokens,
-            moe_floor=moe_floor,
-        )
-        ceiling = min(requested_max, config.max_seq_len, fit)
-        ceiling = (ceiling // page_tokens) * page_tokens
-        initial_aligned = div_ceil(initial, page_tokens) * page_tokens
-        if ceiling < page_tokens * 2 or initial_aligned > ceiling:
-            raise ValueError(
-                f"elastic KV cannot place {initial_aligned} initial tokens under a ceiling of "
-                f"{ceiling} (requested max {requested_max}, checkpoint/override {config.max_seq_len}, "
-                f"budget fits {fit} tokens with {moe_floor} expert slots kept)"
-            )
-        if ceiling != requested_max:
-            logger.info_rank0(
-                f"elastic KV max clamped from {requested_max} to {ceiling} tokens "
-                f"(checkpoint/override {config.max_seq_len}, budget fits {fit})"
-            )
-        moe, pages, overlap = plan_elastic_kv(
-            budget_bytes=budget,
-            per_expert_bytes=per_expert,
-            cache_per_page=cache_per_page,
-            page_size=page_tokens,
-            kv_tokens=initial_aligned,
-            num_experts=num_experts,
-            total_experts=total_experts,
-            prefill_overlap=config.moe_prefill_overlap,
-            max_slots=max_slots,
-            moe_floor=moe_floor,
-        )
-        # per_expert_bytes is a mean. Per-layer pools are wider than that mean, so the
-        # planned slot count can exceed the budget and leave no room for the prefill activation.
-        kv_bytes = pages * cache_per_page
-        fit_pools = self._moe_pools(decode_batch)
-        lo, hi = moe_floor, moe
-        best = None
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            try:
-                sizes = split_slots(mid, fit_pools, self._moe_expert_counts)
-            except ValueError:
-                lo = mid + 1
-                continue
-            if self._moe_pool_bytes(sizes) + kv_bytes <= budget:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        if best is None:
-            raise ValueError(
-                f"elastic KV of {pages * page_tokens} tokens does not fit beside {moe_floor} expert slots"
-            )
-        if best != moe:
-            logger.info_rank0(
-                f"elastic KV: MoE slots {moe} -> {best} so the per-layer pools stay inside the VRAM budget"
-            )
-        moe = best
-        pinned = config.moe_cache_size
-        if pinned > 0:
-            if pinned < moe_floor:
-                raise ValueError(
-                    f"--moe-cache-size {pinned} is below the elastic floor of {moe_floor} slots"
-                )
-            pinned_bytes = self._moe_pool_bytes(
-                split_slots(pinned, fit_pools, self._moe_expert_counts)
-            )
-            if pinned_bytes + kv_bytes > budget + activation_reserve:
-                raise ValueError(
-                    f"--moe-cache-size {pinned} does not fit beside {pages * page_tokens} KV tokens"
-                )
-            if pinned != best:
-                logger.info_rank0(
-                    f"elastic KV: pinned MoE slots {pinned} (budget would allow {best})"
-                )
-            moe = pinned
-        overlap = bool(config.moe_prefill_overlap and moe >= 2 * num_experts)
-        actual = self._moe_pool_bytes(split_slots(moe, fit_pools, self._moe_expert_counts))
-        # Later grows replan from one byte rate. Use the real pool cost so they cannot
-        # exceed the budget the way the layer-mean estimate does.
-        per_expert = max(per_expert, (actual + moe - 1) // moe)
-        if config.num_page_override not in (None, pages) or config.moe_cache_size not in (0, moe):
-            logger.info_rank0(
-                "elastic KV replaces the fixed MoE/KV sizes "
-                f"(moe_cache_size={config.moe_cache_size}, num_page_override={config.num_page_override})"
-            )
-        object.__setattr__(config, "moe_cache_size", moe)
-        object.__setattr__(config, "moe_prefill_overlap", overlap)
-        object.__setattr__(config, "num_page_override", pages)
-        qwen4 = getattr(config.model_config, "qwen4_args", None)
-        activation_width = int(qwen4.hc_count * qwen4.hidden_size) if qwen4 is not None else 0
-        self.elastic_kv = ElasticKv(
-            budget_bytes=budget,
-            per_expert_bytes=per_expert,
-            cache_per_page=cache_per_page,
-            page_size=page_tokens,
-            num_experts=num_experts,
-            total_experts=total_experts,
-            max_slots=max_slots,
-            prefill_overlap=config.moe_prefill_overlap,
-            moe_floor=moe_floor,
-            initial_tokens=pages * page_tokens,
-            max_tokens=ceiling,
-            activation_width=activation_width,
-        )
-        logger.info_rank0(
-            f"elastic KV: start {self.elastic_kv.initial_tokens} tokens, "
-            f"max {ceiling}, MoE slots {moe} (floor {moe_floor})"
-        )
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks, method=None, max_slots=None) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
@@ -1128,9 +932,7 @@ class Engine:
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
         pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
-        if config.kv_initial_tokens is not None or config.kv_max_tokens is not None:
-            self._configure_elastic_kv(config, banks, size_cap)
-        elif config.moe_cache_auto:
+        if config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
@@ -1196,7 +998,6 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
-            prefill_demand_tokens=config.moe_prefill_demand_tokens,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
@@ -1643,12 +1444,8 @@ class Engine:
     def forward_logits(self, batch: Batch) -> torch.Tensor:
         """The batch's logits from its captured graph, or eagerly when none fits."""
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        if getattr(batch, "layer_major", False) and batch.is_prefill:
-            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
-                logits = self._forward_layer_major(batch)
-        else:
-            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1668,18 +1465,7 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        if self.config.tp_info.is_primary():
-            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        else:
-            next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
-        if self.config.tp_info.size > 1:
-            from freetoken.distributed import DistributedCommunicator
-            DistributedCommunicator().broadcast(next_tokens_gpu, src=0)
-        if not self.config.tp_info.is_primary() and args.penalties:
-            for row, counts, _, _ in args.penalties:
-                counts.scatter_add_(
-                    0, next_tokens_gpu[row : row + 1].long(), counts.new_ones(1)
-                )
+        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1687,103 +1473,6 @@ class Engine:
             # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
             self.spec.on_prefill(batch, next_tokens_gpu)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
-
-    def _build_layer_major_chunks(self, batch: Batch) -> list:
-        """Split one admitted long prefill into ordinary eager-forward shaped chunks."""
-        import types
-
-        from freetoken.attention.linear import build_fla_metadata
-        from freetoken.kernel.fla.chunk import CHUNK_SIZE
-
-        req = batch.reqs[0]
-        origin = req.cached_len
-        outer_fla = getattr(batch, "fla_metadata", None)
-        if outer_fla is None:
-            outer_fla = build_fla_metadata(batch, self.device, self.linear_state_pool)
-            batch.fla_metadata = outer_fla
-        track = None
-        if outer_fla.track_dst is not None:
-            assert outer_fla.track_dst.numel() == 1
-            boundary = origin + int(outer_fla.track_boundary_row[0])
-            assert origin < boundary < origin + req.extend_len
-            assert req.mamba_last_track_seqlen == boundary
-            assert req.linear_slot_idx == int(outer_fla.cache_indices[0])
-            track = {
-                "boundary": boundary,
-                "src": int(outer_fla.cache_indices[0]),
-                "dst": int(outer_fla.track_dst[0]),
-                "h_row": int(outer_fla.track_h_row[0]),
-                "conv_src": outer_fla.track_conv_src[0:1],
-                "boundary_row": int(outer_fla.track_boundary_row[0]),
-            }
-        carry = (
-            "table_idx", "uid", "linear_slot_idx", "max_device_len", "mamba_ping_pong",
-            "mamba_next_track_idx", "mamba_restore_src", "swa_evicted_seqlen",
-            "sampling_params", "mrope_delta",
-        )
-        chunks, lo, projections = [], 0, 0
-        while lo < req.extend_len:
-            hi = min(lo + self.config.max_extend_tokens, req.extend_len)
-            if track is not None:
-                boundary = track["boundary"]
-                if origin + lo < boundary < origin + hi and (boundary - origin - lo) % CHUNK_SIZE:
-                    hi = boundary - origin
-            child_req = types.SimpleNamespace(**{key: getattr(req, key, None) for key in carry})
-            child_req.cached_len = origin + lo
-            child_req.device_len = origin + hi
-            child_req.extend_len = hi - lo
-            child_req.mm_items = None
-            child_req.mrope_positions_full = None
-            child = types.SimpleNamespace(
-                phase="prefill",
-                input_ids=batch.input_ids[lo:hi],
-                positions=batch.positions[lo:hi],
-                out_loc=batch.out_loc[lo:hi],
-                mrope_positions=(batch.mrope_positions[:, lo:hi] if getattr(batch, "mrope_positions", None) is not None else None),
-                mm_embeds=None,
-                mm_rows=None,
-                mm_block_ends=None,
-                linear_table_idx=getattr(batch, "linear_table_idx", None),
-                reqs=[child_req],
-                padded_reqs=[child_req],
-            )
-            child.is_decode = False
-            child.is_prefill = True
-            child.size = 1
-            child.get_attn_positions = lambda child=child: (
-                child.mrope_positions if child.mrope_positions is not None else child.positions
-            )
-            child.fla_metadata = build_fla_metadata(child, self.device, self.linear_state_pool, include_track=False)
-            child.track_initial_src = child.track_initial_dst = None
-            if track is not None:
-                boundary = track["boundary"]
-                if boundary == origin + lo:
-                    child.track_initial_src, child.track_initial_dst = track["src"], track["dst"]
-                    projections += 1
-                elif origin + lo < boundary < origin + hi:
-                    local_boundary = boundary - origin - lo
-                    assert local_boundary % CHUNK_SIZE == 0
-                    child.fla_metadata.track_dst = torch.tensor([track["dst"]], dtype=torch.int64, device=self.device)
-                    child.fla_metadata.track_h_row = torch.tensor([track["h_row"] - lo // CHUNK_SIZE], dtype=torch.int64, device=self.device)
-                    child.fla_metadata.track_conv_src = (track["conv_src"] - lo).to(self.device)
-                    child.fla_metadata.track_boundary_row = torch.tensor([track["boundary_row"] - lo], dtype=torch.int64, device=self.device)
-                    projections += 1
-            self.attn_backend.prepare_metadata(child)
-            child.skip_begin_prefill = True
-            child.defer_release_prefill = True
-            chunks.append(child)
-            lo = hi
-        if chunks:
-            chunks[-1].defer_release_prefill = False
-        if track is not None:
-            assert projections == 1, f"layer-major track projected {projections} times"
-        return chunks
-
-    def _forward_layer_major(self, batch: Batch) -> torch.Tensor:
-        chunks = self._build_layer_major_chunks(batch)
-        if self.moe_offload_cache is not None:
-            self.moe_offload_cache.begin_prefill()
-        return self.model.forward_layer_major(chunks)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -2036,37 +1725,7 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
 
 
-def _locked_fetch_wanted(config: EngineConfig) -> bool:
-    """Whether locked layers fetch through pinned staging: hybrid, --moe-locked-fetch not 0, CUDA (the copy kernels are untested on ROCm)."""
-    return config.moe_strategy == "hybrid" and config.moe_locked_fetch != 0 and torch.version.hip is None
-
-
-def _locked_staging_estimate(config: EngineConfig, method, layer_methods) -> int:
-    """Pinned bytes the locked-layer staging will take, for a pin budget set before the load: twice the mean expert per row."""
-    if not (config.moe_cpu_layers and _locked_fetch_wanted(config)):
-        return 0
-    bank_bytes = _bank_bytes(config, method, layer_methods)
-    if not bank_bytes:
-        return 0
-    mean_expert = bank_bytes // (config.model_config.num_moe_layers * config.model_config.num_experts)
-    return 2 * mean_expert * config.moe_locked_max_fetch
-
-
-def _pin_probe_enabled(config: EngineConfig, layer_methods) -> bool:
-    """--moe-cpu-layers auto finds the pin limit by pinning until refused, unless FREETOKEN_PIN_BUDGET_GB fixes it (then a failed pin is an error)."""
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint
-
-    return (
-        (config.moe_cpu_layers or "").strip() == "auto"
-        and not os.environ.get("FREETOKEN_PIN_BUDGET_GB")
-        and config.moe_strategy in ("offload", "hybrid")
-        and layer_methods is None
-        and not config.use_dummy_weight
-        and not (config.model_path and is_ftw_checkpoint(config.model_path))  # FTW settles its banks itself
-    )
-
-
-def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None, all_methods=None) -> frozenset[int]:
+def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
     """MoE layer ids whose decode runs on the CPU executor.
 
     ``--moe-strategy cpu`` -> every layer. ``--moe-strategy offload`` + ``--moe-cpu-layers``
@@ -2078,7 +1737,7 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: 
     if not spec or not is_offload_moe_strategy(config.moe_strategy):
         return frozenset()
     if spec.strip() == "auto":
-        return _auto_cpu_layers(config, num_moe_layers, reserved=reserved, method=method, all_methods=all_methods)
+        return _auto_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
@@ -2164,27 +1823,10 @@ def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None, layer
         )
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None, all_methods=None) -> frozenset[int]:
+def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: int = 0, method=None) -> frozenset[int]:
     """Pick CPU (locked) MoE layers for ``--moe-cpu-layers auto``: none while the banks fit the pin budget.
 
-    Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache.
-    FREETOKEN_LOCK_BY_BYTES=1 locks the largest layers first instead, so fewer layers lose their pin."""
-    if os.environ.get("FREETOKEN_LOCK_BY_BYTES") == "1" and all_methods and _pin_budget_bytes(reserved) is not None:
-        from freetoken.moe.expert_banks import _method_expert_bytes
-
-        per = [_method_expert_bytes(m) for m in all_methods]
-        budget = _pin_budget_bytes(reserved)
-        locked, rest = set(), sum(per)
-        for layer in sorted(range(len(per)), key=lambda l: -per[l]):
-            if rest <= budget:
-                break
-            locked.add(layer)
-            rest -= per[layer]
-        logger.info_rank0(
-            f"--moe-cpu-layers auto (by bytes): banks {sum(per) / 2**30:.2f} GiB > pin budget {budget / 2**30:.2f} GiB; "
-            f"locking the {len(locked)} largest MoE layers ({sorted(locked)}), {rest / 2**30:.2f} GiB stays pinned"
-        )
-        return frozenset(locked)
+    Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
     bank_bytes = _bank_bytes(config, method)
     if not bank_bytes:
         return frozenset()
@@ -2224,7 +1866,6 @@ _DENSE_MOE_SETTINGS = {
     "moe_locked_max_fetch": 8,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
-    "moe_preseed": False,
     "expert_load": "auto",
 }
 
@@ -2413,26 +2054,6 @@ def _adjust_config(config: EngineConfig):
     # lists, then validate whatever is now selected (explicit or auto) -- every
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
-    # Resolve KV quantization BEFORE the backend tree: a quantized pool narrows both
-    # which pool families are usable and which backend auto may pick.
-    kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
-    override("kv_quant", kv_quant)
-    if kv_quant != "none":
-        # fp8 codes are wired through the pools that hand their rows to a Triton
-        # kernel: plain paged and hybrid-SWA, QSA sparse, and DSA/MLA. QSA's index
-        # tier and DSA's index-key/tail tiers stay bf16; the DSA kernel dequantizes
-        # selected latent rows with their per-token scale. Other sparse families have
-        # no scale-read path and remain rejected before weights load.
-        quant_unsupported = required_attn_types - {
-            AttnType.FULL, AttnType.SWA, AttnType.QSA, AttnType.MLA, AttnType.DSA,
-        }
-        if quant_unsupported:
-            raise ValueError(
-                f"--kv-cache-dtype {kv_quant} is implemented for the plain paged, "
-                "hybrid-SWA, QSA sparse and DSA/MLA KV pools; this model also needs "
-                f"{', '.join(sorted(t.value for t in quant_unsupported))} attention "
-                "(use --kv-cache-dtype bf16)."
-            )
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
     if (
         required_attn_types & {AttnType.BSA, AttnType.QSA}
@@ -2460,10 +2081,11 @@ def _adjust_config(config: EngineConfig):
     if _dtype == torch.float16 and getattr(getattr(model_config, "quant", None), "weight_scales", False):
         # GGUF NVFP4 results are stored in the activation dtype before weight_scale_2 (~1e-4) multiplies them, which overflows fp16.
         raise ValueError("--dtype float16 with NVFP4 GGUF weight scales is unsupported (the unscaled results overflow float16); use bfloat16.")
+    _validate_kv_format(config, model_config)
     if config.attention_backend == "auto":
         override(
             "attention_backend",
-            _resolve_auto_attention_backend(required_attn_types, kv_quant=kv_quant),
+            _resolve_auto_attention_backend(required_attn_types, getattr(config, "kv_format", NONE)),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)

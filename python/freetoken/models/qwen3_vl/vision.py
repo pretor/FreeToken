@@ -214,7 +214,14 @@ class Qwen3VLVisionModel(BaseOP):
     Columns past out_hidden are the DeepStack side features in deepstack_visual_indexes order.
     """
 
-    def __init__(self, vc: VisionConfig, *, quant_config: QuantConfig | None = None, prefix: str = "visual"):
+    def __init__(
+        self,
+        vc: VisionConfig,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "visual",
+        rope_dtype: torch.dtype | None = None,
+    ):
         # the blocks stream to the GPU in one shared layout, which entropy-sized online buffers break
         quant_config = without_online(quant_config)
         self.patch_embed = VisionConv3dPatchEmbed(vc)
@@ -234,6 +241,7 @@ class Qwen3VLVisionModel(BaseOP):
         self._vc = vc
         self._num_grid_per_side = int(vc.num_position_embeddings**0.5)
         self._inv_dim = (vc.hidden_size // vc.num_heads) // 2
+        self._rope_dtype = rope_dtype
         self._inv_freq: torch.Tensor | None = None
         self._streamer: BlockWeightStreamer | None = None
 

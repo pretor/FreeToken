@@ -592,11 +592,15 @@ class Engine:
 
             self.mm_processor = get_mm_processor(config.model_path, config.mm)
             self.encoder_cache = EncoderCache(storage=config.mm.embed_cache_device)
+            placement = (
+                "the CPU encoder process" if config.mm.encoder_out_of_process else config.mm.encoder_weights
+            )
             logger.info_rank0(
                 f"Multimodal enabled: {type(self.mm_processor).__name__}, encoders "
-                f"{[e.kind for e in config.active_encoders]} on {config.mm.encoder_weights}, serving {sorted(config.served_modalities)}"
+                f"{[e.kind for e in config.active_encoders]} on {placement}, serving {sorted(config.served_modalities)}"
             )
-            self._warmup_encoders()
+            if not config.mm.encoder_out_of_process:
+                self._warmup_encoders()
         elif any(getattr(config.hf_config, key, None) is not None for key in ENCODER_SECTIONS):
             logger.info_rank0(
                 "Multimodal disabled: --text-model-only"

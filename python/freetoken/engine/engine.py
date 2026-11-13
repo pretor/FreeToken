@@ -552,8 +552,9 @@ class Engine:
                     f"{type(self.model).__name__} has encoders registered but lacks the SupportsMultimodal hooks; "
                     "run with --text-model-only"
                 )
-            # before the residency snapshot, so streamed blocks are not charged as resident weights
-            self.model.place_encoder_weights(config.mm.encoder_weights)
+            if not config.mm.encoder_out_of_process:
+                # before the residency snapshot, so streamed blocks are not charged as resident weights
+                self.model.place_encoder_weights(config.mm.encoder_weights)
         # draft weights load before any pool is sized, so every free-memory read below counts them
         self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]

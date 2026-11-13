@@ -67,6 +67,7 @@ def _engine(chunk):
     engine.config = SimpleNamespace(max_extend_tokens=chunk)
     engine.device = torch.device("cpu")
     engine.attn_backend = _AttnBackend()
+    engine.linear_state_pool = _Pool()
     return engine
 
 
@@ -243,7 +244,7 @@ def test_layer_major_prefill_has_a_hard_request_size_bound(prompt_len, expected_
 def test_layer_major_children_keep_absolute_lengths_and_one_checkpoint(cached_len):
     _ctx()
     batch = _batch(cached_len=cached_len)
-    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"))
+    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"), _Pool())
     chunks = _engine(4096)._build_layer_major_chunks(batch)
 
     assert [(c.reqs[0].cached_len, c.reqs[0].device_len) for c in chunks] == [
@@ -261,7 +262,7 @@ def test_layer_major_children_keep_absolute_lengths_and_one_checkpoint(cached_le
 def test_layer_major_projects_an_interior_checkpoint_once():
     _ctx()
     batch = _batch(extend_len=7000)
-    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"))
+    batch.fla_metadata = build_fla_metadata(batch, torch.device("cpu"), _Pool())
     chunks = _engine(4096)._build_layer_major_chunks(batch)
 
     assert len(chunks) == 2

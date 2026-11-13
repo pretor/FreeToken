@@ -756,7 +756,7 @@ class Engine:
                 config.model_path,
                 self.device,
                 include_moe_experts=not getattr(config.model_config, "is_moe", False),
-                include_vision=bool(config.active_encoders),
+                include_vision=bool(config.active_encoders) and not config.mm.encoder_out_of_process,
             ),
             device=self.device,
             host_keys=host_keys,

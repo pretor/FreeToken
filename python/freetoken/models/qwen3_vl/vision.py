@@ -50,16 +50,17 @@ def _apply_vision_rope(
 ) -> None:
     """In-place 2D rope through the NeoX text kernel: the [c,c]/[s,s] layout is the half-rotation layout and positions index per-token cache rows."""
     S = q.shape[0]
-    try:
-        from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
+    if q.is_cuda:
+        try:
+            from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
 
-        apply_rope_with_cos_sin_cache_inplace(
-            positions, q.view(S, -1), k.view(S, -1), head_dim, cache, is_neox=True
-        )
-        return
-    except ImportError:
-        # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
-        logger.warning_once("vision rope triton kernel unavailable; using eager")
+            apply_rope_with_cos_sin_cache_inplace(
+                positions, q.view(S, -1), k.view(S, -1), head_dim, cache, is_neox=True
+            )
+            return
+        except ImportError:
+            # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
+            logger.warning_once("vision rope triton kernel unavailable; using eager")
     half = cache.shape[1] // 2
     cos = torch.cat((cache[:, :half], cache[:, :half]), dim=-1).unsqueeze(-2)
     sin = torch.cat((cache[:, half:], cache[:, half:]), dim=-1).unsqueeze(-2)
